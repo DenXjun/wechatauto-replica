@@ -103,6 +103,29 @@ class VoiceMessage(BaseMessage):
             return WxResponse.failure(f'本地未找到该语音文件（local_id={local_id}）')
         return gui.send_file(path, who)
 
+    def transcribe(self, base_url: str = None, api_key: str = None,
+                   model: str = None, sample_rate: int = 24000,
+                   timeout: float = 120.0) -> WxResponse:
+        """使用 OpenAI 兼容 ASR 服务识别这条语音。"""
+        chat = getattr(self.parent, 'root', None)
+        db = getattr(chat, '_db', None) if chat is not None else None
+        local_id = getattr(self, 'local_id', None)
+        user = getattr(chat, '_wxid', '') if chat is not None else ''
+        if db is None or local_id is None or not user:
+            return WxResponse.failure('消息缺少会话上下文，无法识别语音')
+        from wechatauto.media import MediaDownloader
+        try:
+            text = MediaDownloader(db).transcribe_voice(
+                str(user), int(local_id), base_url=base_url,
+                api_key=api_key, model=model,
+                sample_rate=sample_rate, timeout=timeout,
+            )
+        except Exception as exc:
+            return WxResponse.failure('语音识别失败：%s' % exc)
+        if text is None:
+            return WxResponse.failure(f'本地未找到该语音文件（local_id={local_id}）')
+        return WxResponse.success('语音识别完成', data={'text': text})
+
 
 class ImageMessage(BaseMessage):
     type = 'image'

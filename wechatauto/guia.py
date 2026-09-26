@@ -1431,6 +1431,18 @@ class WeChatGUI:
         点击点取输入框顶部文本行附近（而非中心），避免点到下方
         表情/工具栏而无法聚焦。
         """
+        # 微信窗口缩放或 DPI 变化时，OCR 坐标可能与实际输入框错位；已启用
+        # 的 UIA 可以直接定位 ChatInputField，优先用它聚焦。
+        uia = self._get_uia()
+        if uia is not None:
+            try:
+                edit = uia._chat_input()
+                if edit is not None:
+                    edit.Click()
+                    time.sleep(0.3)
+                    return True
+            except Exception:
+                pass
         if box is None:
             box = self.get_input_box()
         if not box:
@@ -2085,6 +2097,49 @@ class WeChatGUI:
         if who:
             self.open_chat(who)
             time.sleep(0.8)
+
+        # 微信 4.x 的群成员弹层与输入框可由 UIA 稳定定位。优先走该路径，
+        # 避免窗口缩放或 DPI 变化导致 OCR 坐标落在输入框之外。
+        uia = self._get_uia()
+        if uia is not None:
+            try:
+                edit = uia._chat_input()
+                if edit is not None:
+                    uia._paste_into(edit, '@', clear=True)
+                    time.sleep(0.8)
+
+                    def find_mention_list(ctrl, depth=0):
+                        if depth > 8:
+                            return None
+                        for child in ctrl.GetChildren():
+                            if child.AutomationId == 'chat_mention_list':
+                                return child
+                            found = find_mention_list(child, depth + 1)
+                            if found is not None:
+                                return found
+                        return None
+
+                    mention_list = find_mention_list(uia._win)
+                    if mention_list is not None:
+                        target = next((item for item in mention_list.GetChildren()
+                                       if member == (item.Name or '')
+                                       or member in (item.Name or '')), None)
+                        if target is not None:
+                            target.Click()
+                            time.sleep(0.4)
+                            uia._paste_into(edit, text, clear=False)
+                            time.sleep(0.2)
+                            edit.SendKeys('{Enter}', waitTime=0.05)
+                            if verify:
+                                ok = self._verify_sent(text, who)
+                                return (WxResponse.success('@成员消息已发送并确认',
+                                                           data={'member': member, 'content': text})
+                                        if ok else WxResponse.failure('@消息已操作发送，但数据库未确认',
+                                                                      data={'member': member}))
+                            return WxResponse.success('@成员消息已发送',
+                                                      data={'member': member, 'content': text})
+            except Exception:
+                pass
         if not self.focus_input():
             return WxResponse.failure('输入框不可用')
         self._input.type_unicode('@')
