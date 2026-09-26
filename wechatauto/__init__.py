@@ -12,6 +12,7 @@ from .logger import wxlog
 from .moment import Moment, MomentDB
 from .db import WeChatDB, GroupMemberWatcher, auto_detect_db_dir, list_accounts
 from .media import MediaDownloader
+from .asr import ASRError, OpenAICompatibleASR
 from .guia import (
     WeChatGUI,
     quick_send,
@@ -60,6 +61,8 @@ __all__ = [
     "auto_detect_db_dir",
     "list_accounts",
     "MediaDownloader",
+    "ASRError",
+    "OpenAICompatibleASR",
     "WeChatGUI",
     "quick_send",
     "quick_send_file",

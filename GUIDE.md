@@ -337,7 +337,31 @@ out = md.download_image_original("filehelper", 123, timeout=30)
 
 返回落盘路径，失败返回 `None`。 / Returns the saved path, or `None` on failure.
 
-### 6.3 群聊图片 / Group chat images
+### 6.3 语音转文字 / Speech to text
+
+安装可选的 SILK 解码依赖：
+
+```bash
+pip install "wechatauto-replica[asr]"
+```
+
+项目会把微信 `.silk` 语音临时转换为 WAV，再调用 OpenAI 兼容的
+`/v1/audio/transcriptions` 接口。配置可以通过参数传入，也可以使用环境变量
+`WECHAT_ASR_BASE_URL`、`WECHAT_ASR_API_KEY`、`WECHAT_ASR_MODEL`：
+
+```python
+text = md.transcribe_voice(
+    "filehelper", 123,
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="your-key",
+    model="Qwen3-ASR-0.6B-4bit",
+)
+print(text)
+```
+
+`VoiceMessage.transcribe()` 提供相同能力。ASR 密钥不会写入项目配置或仓库。
+
+### 6.4 群聊图片 / Group chat images
 
 - 群聊图片原图**只有点开查看过才落盘**；否则只有缩略图 / originals only stored after being opened
 - `download_image` 会自动回退缩略图，文件名带 `_thumb` 标记 / auto-falls back to thumbnail (`_thumb`)

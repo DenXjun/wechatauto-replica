@@ -65,6 +65,72 @@ def aligned_aes_block_size(aes_size: int) -> int:
 class MediaDownloader:
     """微信 4.x 媒体下载器"""
 
+    @staticmethod
+    def _local_type_code(row: dict) -> Optional[int]:
+        """Return the base message type, unwrapping WeChat 4.x resource flags."""
+        try:
+            local_type = int(row.get("local_type"))
+        except (TypeError, ValueError):
+            return None
+        return (local_type & 0xFF) if local_type > 0xFFFF else local_type
+
+    @staticmethod
+    def _protobuf_text_values(data: bytes, max_depth: int = 4) -> List[str]:
+        """Extract UTF-8 text fields from a length-delimited protobuf payload."""
+        values: List[str] = []
+
+        def read_varint(blob: bytes, offset: int) -> Tuple[int, int]:
+            value = 0
+            shift = 0
+            while offset < len(blob) and shift < 70:
+                byte = blob[offset]
+                offset += 1
+                value |= (byte & 0x7F) << shift
+                if byte < 0x80:
+                    return value, offset
+                shift += 7
+            raise ValueError("invalid protobuf varint")
+
+        def visit(blob: bytes, depth: int) -> None:
+            if depth > max_depth:
+                return
+            offset = 0
+            while offset < len(blob):
+                try:
+                    key, offset = read_varint(blob, offset)
+                    wire_type = key & 0x07
+                    if key == 0:
+                        return
+                    if wire_type == 0:
+                        _, offset = read_varint(blob, offset)
+                    elif wire_type == 1:
+                        offset += 8
+                    elif wire_type == 2:
+                        size, offset = read_varint(blob, offset)
+                        end = offset + size
+                        if end > len(blob):
+                            return
+                        payload = blob[offset:end]
+                        offset = end
+                        try:
+                            value = payload.decode("utf-8")
+                        except UnicodeDecodeError:
+                            value = ""
+                        if value and not any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in value):
+                            values.append(value)
+                        visit(payload, depth + 1)
+                    elif wire_type == 5:
+                        offset += 4
+                    else:
+                        return
+                    if offset > len(blob):
+                        return
+                except (ValueError, IndexError):
+                    return
+
+        visit(data, 0)
+        return values
+
     def __init__(self, db, save_dir: Optional[str] = None,
                  image_key: Optional[str] = None,
                  cfg_dword: Optional[int] = None):
@@ -519,7 +585,7 @@ class MediaDownloader:
                        aes_key: Optional[str] = None, xor_key: Optional[int] = None) -> Optional[str]:
         """下载图片消息并解密为 jpg/png/gif，返回落盘路径"""
         row = self.db.get_message_row(user, local_id)
-        if not row or row["local_type"] != 3:
+        if not row or self._local_type_code(row) != 3:
             return None
         md5 = self._img_md5(row)
         if not md5:
@@ -566,7 +632,7 @@ class MediaDownloader:
         微信按账号/时间把语音分片存到多个 media_*.db，逐个搜索直到找到。
         """
         row = self.db.get_message_row(user, local_id)
-        if not row or row["local_type"] != 34 or not row["server_id"]:
+        if not row or self._local_type_code(row) != 34 or not row["server_id"]:
             return None
         for rel, path, _ in self.db._db_files:
             if not os.path.basename(path).startswith("media_"):
@@ -593,10 +659,35 @@ class MediaDownloader:
                 return out
         return None
 
+    def transcribe_voice(self, user: str, local_id: int,
+                         base_url: Optional[str] = None,
+                         api_key: Optional[str] = None,
+                         model: Optional[str] = None,
+                         sample_rate: int = 24000,
+                         timeout: float = 120.0) -> Optional[str]:
+        """Extract a WeChat voice message and transcribe it with an ASR service.
+
+        The ASR client is created lazily, so the optional ``pysilk`` dependency
+        is only required when this method is used.  Configuration can be passed
+        explicitly or read from ``WECHAT_ASR_BASE_URL``, ``WECHAT_ASR_API_KEY``
+        and ``WECHAT_ASR_MODEL``.
+        """
+        path = self.download_voice(user, local_id)
+        if not path:
+            return None
+        from .asr import OpenAICompatibleASR
+        client = OpenAICompatibleASR(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout=timeout,
+        )
+        return client.transcribe_silk(path, sample_rate=sample_rate)
+
     def download_video(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
         """视频：按 packed_info 中的 id 在 msg/video 下查找 <id>.mp4"""
         row = self.db.get_message_row(user, local_id)
-        if not row or row["local_type"] != 43:
+        if not row or self._local_type_code(row) != 43:
             return None
         pi = row.get("packed_info")
         if not isinstance(pi, bytes):
@@ -631,18 +722,28 @@ class MediaDownloader:
             finally:
                 conn.close()
             if r and r["packed_info"]:
-                name = r["packed_info"].decode("utf-8", "replace").strip()
-                name = re.sub(r"[\r\n\x00]+", "", name)
-                if "/" in name or "\\" in name:
-                    name = name.split("/")[-1].split("\\")[-1]
-                return name or None
+                packed_info = r["packed_info"]
+                if isinstance(packed_info, bytes):
+                    candidates = self._protobuf_text_values(packed_info)
+                    if not candidates:
+                        candidates = [packed_info.decode("utf-8", "replace")]
+                else:
+                    candidates = [str(packed_info)]
+                for candidate in reversed(candidates):
+                    name = candidate.strip()
+                    name = re.sub(r"[\r\n\x00]+", "", name)
+                    if "/" in name or "\\" in name:
+                        name = name.split("/")[-1].split("\\")[-1]
+                    if name and not any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in name):
+                        return name
+                return None
             break
         return None
 
     def download_file(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
         """文件：msg/file/<YYYY-MM>/<原文件名>，原文件名来自 message_resource"""
         row = self.db.get_message_row(user, local_id)
-        if not row or row["local_type"] != 49:
+        if not row or self._local_type_code(row) != 49:
             return None
         name = self._file_name(row)
         if not name:
@@ -696,7 +797,7 @@ class MediaDownloader:
             解密后的原图文件路径，失败返回 None
         """
         row = self.db.get_message_row(user, local_id)
-        if not row or row["local_type"] != 3:
+        if not row or self._local_type_code(row) != 3:
             return None
         md5 = self._img_md5(row)
         if not md5:
@@ -837,7 +938,7 @@ class MediaDownloader:
         row = self.db.get_message_row(user, local_id)
         if not row:
             return None
-        t = row["local_type"]
+        t = self._local_type_code(row)
         if t == 3:
             return self.download_image(user, local_id, save_dir)
         if t == 34:
