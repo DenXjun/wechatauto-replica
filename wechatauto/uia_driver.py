@@ -83,6 +83,9 @@ CHAT_INPUT_AIDS = ("chat_input_field",)
 SNS_LIST_CLASSES = ("mmui::TimeLineListView",)
 SNS_LIST_AIDS = ("sns_list",)
 
+# 「扫不到可用窗口」这类失败每种原因一个进程只警告一次（长驻进程每轮都扫）
+_GATE_BLOCK_WARNED = set()
+
 # 左侧导航栏（4.1.13 实测）：MainTabBar 下四个 XTabBarItem，顺序固定
 # 微信/通讯录/收藏/发现。tab 自己读不到选中态（ButtonControl，既不支持
 # SelectionItem 模式，LegacyIAccessible.State 也恒为 0），各页控件在树里又常驻，
@@ -782,7 +785,19 @@ class WeChatUIA:
         return ok
 
     # ------------------------------------------------------------------ 窗口定位
-    def _wechat_hwnds(self):
+    def _wechat_hwnds(self, diag: Optional[dict] = None):
+        """可见、标题像主窗的微信窗口，按面积从大到小。
+
+        只保留加载了 Weixin.dll 的主进程窗口，过滤掉无 DLL 的辅助进程窗口
+        （其热激活必然失败，只会产生噪音警告）。
+
+        ``diag`` 传一个 dict 时会填入扫描计数（``win32`` / ``matched`` / ``kept`` /
+        ``dropped_no_dll``），供「一个窗口都没留下」时给出能定位的警告——那正是
+        32 位解释器读不到 64 位进程模块的特征，静默返回空会被用户当成「控件树被屏蔽」。
+        """
+        if diag is not None:
+            diag.update({'win32': bool(_HAS_WIN32), 'matched': 0, 'kept': 0,
+                         'dropped_no_dll': 0})
         if not _HAS_WIN32:
             return []
         res = []
@@ -791,12 +806,16 @@ class WeChatUIA:
             try:
                 title = win32gui.GetWindowText(h)
                 if win32gui.IsWindowVisible(h) and _title_is_main(title):
-                    # 只保留加载了 Weixin.dll 的主进程窗口，过滤掉无 DLL 的
-                    # 辅助进程窗口（其热激活必然失败，只会产生噪音警告）
+                    if diag is not None:
+                        diag['matched'] += 1
                     pid = self._pid_from_hwnd(h)
                     if pid and self._weixin_dll_module(pid):
                         l, t, r, b = win32gui.GetWindowRect(h)
                         res.append(((r - l) * (b - t), h))
+                        if diag is not None:
+                            diag['kept'] += 1
+                    elif diag is not None:
+                        diag['dropped_no_dll'] += 1
             except Exception:
                 pass
             return True
@@ -806,6 +825,40 @@ class WeChatUIA:
             pass
         res.sort(reverse=True)
         return [h for _, h in res]
+
+    @staticmethod
+    def gate_block_hint(diag: dict, bits: Optional[int] = None) -> str:
+        """把「扫不到可用窗口」翻译成一句能定位的话（纯函数，便于离线自检）。"""
+        if bits is None:
+            bits = ctypes.sizeof(ctypes.c_void_p) * 8
+        matched = (diag or {}).get('matched', 0)
+        kept = (diag or {}).get('kept', 0)
+        if (diag or {}).get('win32', True) is False:
+            return ("pywin32 不可用，UIA 驱动整条路都用不了（安装：pip install pywin32）")
+        if matched == 0:
+            return ("没扫到可见的微信主窗口：微信未启动/未登录/最小化到托盘，"
+                    "或窗口标题不再包含「微信/Weixin」。UIA 这条路不会自己出现控件树。")
+        if kept == 0:
+            return ("扫到 %d 个微信窗口，但每个都定位不到 Weixin.dll 模块，热激活无从下手。"
+                    "当前解释器是 %d 位。%s"
+                    % (matched, bits,
+                       ("32 位 Python 无法枚举 64 位进程的模块（ERROR_PARTIAL_COPY），"
+                        "请改用 64 位 Python。" if bits == 32 else
+                        "64 位下还拿不到模块，通常是权限/完整性级别不一致"
+                        "（别用「以管理员身份运行」，让脚本与微信同级）"
+                        "或安全软件拦了模块枚举/进程读取——把 python 加入白名单再试。")))
+        return ""
+
+    def _warn_gate_blocked(self, diag: dict) -> None:
+        """同一种原因一个进程只说一次：长驻进程每次轮询都扫，刷屏比不说更糟。"""
+        hint = self.gate_block_hint(diag)
+        if not hint:
+            return
+        key = hint.split('。')[0][:40]
+        if key in _GATE_BLOCK_WARNED:
+            return
+        _GATE_BLOCK_WARNED.add(key)
+        wxlog.warning("控件树拿不到（本轮不会热激活 gate）：%s", hint)
 
     def _anchor(self, hwnd):
         try:
@@ -966,7 +1019,9 @@ class WeChatUIA:
         """
         if not force and self._find_main() is not None:
             return True
-        if not self._wechat_hwnds():
+        scan = {}
+        if not self._wechat_hwnds(scan):
+            self._warn_gate_blocked(scan)
             return False
         deadline = time.time() + max(1.0, timeout)
         while True:
@@ -999,6 +1054,11 @@ class WeChatUIA:
                 # 窗口在但树可能是 Qt 空壳：热写 gate 并校验（候选自动重试）
                 self.ensure_materialized(timeout=min(6.0, max(2.0, timeout / 2)))
             else:
+                # 走到这里说明连可用窗口都没扫到：以前是静默改走「读屏标志 + wake」，
+                # 用户只看到「没树」，看不出是没登录还是位数不对。
+                scan = {}
+                self._wechat_hwnds(scan)
+                self._warn_gate_blocked(scan)
                 self._set_screen_reader_flag(True)
                 self.wake()
             self._wait_main(timeout)

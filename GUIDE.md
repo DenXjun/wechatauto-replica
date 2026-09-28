@@ -641,7 +641,11 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 ### Q5: 语音下载不到 / voice not downloading
 
 - 1.1.4+ 已支持搜索所有 `media_*.db`（微信分片存储）/ 1.1.4+ searches all media_*.db
-- 确认升级到最新版本 / make sure you're on the latest version
+- **1.2.4.1 起先问一句「到底为什么」**：`md.list_voice_status(user)` /
+  `md.voice_status(user, local_id)` 会给每条语音 `available` / `bytes` /
+  `download_status` / `reason`。`reason=audio_not_downloaded` 表示微信没把这段音频
+  落盘（在界面里播放一次即可），`audio_missing_from_media_db` 才是可能的库侧问题
+  / `list_voice_status()` tells you *why*: not-downloaded vs a real lookup bug
 
 ### Q6: 监听无聊天记录的联系人 / contact with no history
 
@@ -652,6 +656,30 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 
 - 本库入口类是 **`WeChat`**，不存在 `WeChatAuto`
 - 教程代码若用旧类名，把 `WeChatAuto()` 换成 `WeChat()`
+
+### Q8: 「控件树被屏蔽」/ UIA tree is empty
+
+先分清两件事：**微信自绘界面，UIA 树只有在 Qt accessibility gate 打开后才存在**，
+而那个 gate 是 `Weixin.dll` 在进程里的一个字节，微信**每次重启/更新/重登都会归零**。
+所以它不是被谁屏蔽，而是没人写它的时候树就不存在。库在每次走 UIA 入口时会自己热写并校验
+（日志：`热激活 UIA：PID=… Weixin.dll+0x…: 0 -> 1`）。
+
+判据（一行）：看微信窗口的 ClassName —— `mmui::MainWindow` = 树在；
+`Qt51514QWindowIcon` = 树没建 / class is `Qt51514QWindowIcon` means no tree。
+
+扫不到可用窗口时，库现在会明确警告原因（每种原因一个进程只说一次，不刷屏）：
+
+| 警告里的说法 | 真实原因 |
+|---|---|
+| 没扫到可见的微信主窗口 | 微信未启动/未登录/最小化到托盘，或标题变了 |
+| 扫到 N 个窗口但都定位不到 Weixin.dll，**32 位** | 32 位 Python 无法枚举 64 位进程模块，换 64 位 Python |
+| 同上但是 **64 位** | 权限/完整性级别不一致（别「以管理员运行」）或安全软件拦进程读取 |
+| `pywin32` 不可用 | 没装 pywin32，UIA 路线整条不可用 |
+
+热激活本身失败的三种日志原文分别对应：`不支持的 Weixin.dll 版本路径`（新版本 gate RVA
+漂移且扫不出候选，需要加 RVA）、`无法打开 Weixin.exe PID`（权限/安全软件）、
+`N 个候选均未使 mmui 树物化`（写进去了但 Qt 不建树）。
+另外：跑在没有交互桌面的会话里（服务、非交互计划任务、RDP 已断开）永远不会有树。
 
 ---
 

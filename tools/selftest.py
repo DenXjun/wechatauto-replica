@@ -1331,15 +1331,148 @@ def t_voice() -> None:
     _os.rmdir(_os.path.dirname(media_path))
 
 
+# ----------------------------------------------------------------------
+# 13. 控件树拿不到时的可定位警告（纯离线：假 win32gui，不碰微信）
+# ----------------------------------------------------------------------
+def t_tree() -> None:
+    """「控件树被屏蔽」以前是静默失败：扫不到可用窗口就直接 return False。
+    现在必须把它翻译成一句话——尤其是 32 位解释器读不到 64 位模块这一类。"""
+    import types
+
+    import wechatauto.uia_driver as ud
+    from wechatauto.uia_driver import WeChatUIA
+
+    u = WeChatUIA.__new__(WeChatUIA)
+
+    print("[tree] 扫描计数")
+    wins = {1: ('微信', True, (0, 0, 900, 700)),      # 正常：有 pid 有 DLL
+            2: ('微信(3)', True, (0, 0, 500, 400)),   # 取不到 DLL
+            3: ('Weixin', True, (0, 0, 300, 300)),    # 连 pid 都没有
+            4: ('某浏览器', True, (0, 0, 999, 999)),  # 标题不是微信
+            5: ('微信', False, (0, 0, 800, 800))}     # 不可见
+    fake = types.SimpleNamespace(
+        EnumWindows=lambda cb, p: [cb(h, None) for h in sorted(wins)],
+        GetWindowText=lambda h: wins[h][0],
+        IsWindowVisible=lambda h: wins[h][1],
+        GetWindowRect=lambda h: wins[h][2])
+    o_gui, o_has = ud.win32gui, ud._HAS_WIN32
+    ud.win32gui, ud._HAS_WIN32 = fake, True
+    try:
+        u._pid_from_hwnd = lambda h: 0 if h == 3 else (100 + h)
+        u._weixin_dll_module = lambda pid: (0x1000, 1, 'Weixin.dll') if pid == 101 else None
+        diag = {}
+        got = u._wechat_hwnds(diag)
+        check("只保留有 Weixin.dll 的主进程窗口（老行为不变）", got == [1], str(got))
+        check("diag 记下了 matched/kept/dropped，供警告区分场景",
+              diag['matched'] == 3 and diag['kept'] == 1
+              and diag['dropped_no_dll'] == 2, str(diag))
+        check("面积大的窗口排在前面（多个微信窗口时选主窗）", got[0] == 1)
+        hint = u.gate_block_hint(diag)
+        check("还有窗口留下时不打扰（返回空串）", hint == '', hint)
+        check("32 位解释器 + 模块全拿不到 → 明说位数并让换 64 位",
+              '32 位' in u.gate_block_hint(
+                  {'win32': True, 'matched': 3, 'kept': 0}, 32))
+        h64 = u.gate_block_hint({'win32': True, 'matched': 3, 'kept': 0}, 64)
+        check("64 位下同样失败 → 指向权限/安全软件，而不是乱猜位数",
+              '管理员' in h64 and '安全软件' in h64 and '改用 64 位' not in h64)
+        h0 = u.gate_block_hint({'win32': True, 'matched': 0, 'kept': 0})
+        check("一个窗口都没扫到 → 说清是没启动/未登录/在托盘",
+              '未启动' in h0 and '托盘' in h0, h0[:40])
+        hw = u.gate_block_hint({'win32': False, 'matched': 0, 'kept': 0})
+        check("pywin32 缺失是另一种原因，不能混成「没登录」",
+              'pywin32' in hw, hw[:40])
+    finally:
+        ud.win32gui, ud._HAS_WIN32 = o_gui, o_has
+
+    o_has3 = ud._HAS_WIN32
+    ud._HAS_WIN32 = False
+    try:
+        diag2 = {}
+        check("_HAS_WIN32=False 时也把诊断写进 diag（不能空着）",
+              u._wechat_hwnds(diag2) == [] and diag2.get('win32') is False, str(diag2))
+    finally:
+        ud._HAS_WIN32 = o_has3
+
+    print("[tree] 每种原因只说一次")
+
+    class Counter:
+        def __init__(self):
+            self.msgs = []
+
+        def warning(self, fmt, *a, **k):
+            self.msgs.append(fmt % a if a else fmt)
+
+        def info(self, *a, **k):
+            pass
+
+        def debug(self, *a, **k):
+            pass
+
+    c = Counter()
+    o_log, o_set = ud.wxlog, set(ud._GATE_BLOCK_WARNED)
+    ud.wxlog, ud._GATE_BLOCK_WARNED = c, set()
+    try:
+        bad = {'win32': True, 'matched': 2, 'kept': 0}
+        u._warn_gate_blocked(bad)
+        u._warn_gate_blocked(bad)
+        u._warn_gate_blocked({'win32': True, 'matched': 0, 'kept': 0})
+        check("同一种原因重复触发只警告一次", len(c.msgs) == 2, str(len(c.msgs)))
+        n_before = len(c.msgs)
+        u._warn_gate_blocked({'win32': True, 'matched': 2, 'kept': 2})
+        check("健康场景（有窗口留下）完全不打扰", len(c.msgs) == n_before,
+              "多出 %d 条" % (len(c.msgs) - n_before))
+        check("警告文案里带上「没热激活」这个后果，便于用户对上症状",
+              all('控件树' in m for m in c.msgs), str(c.msgs)[:60])
+
+        # 集成：ensure_materialized 扫不到窗口时必须走一次警告并返回 False
+        hits = {'n': 0}
+        o_warn = WeChatUIA.__dict__["_warn_gate_blocked"]
+
+        def spy(self, diag):
+            hits['n'] += 1
+            return None
+
+        WeChatUIA._warn_gate_blocked = spy
+        o_gui2, o_has2 = ud.win32gui, ud._HAS_WIN32
+        ud.win32gui, ud._HAS_WIN32 = fake, True
+        try:
+            u._find_main = lambda: None
+            u._wechat_hwnds = lambda diag=None: []
+            check("ensure_materialized 扫不到窗口时不再静默返回",
+                  u.ensure_materialized(timeout=1.0) is False and hits['n'] == 1,
+                  "警告 %d 次" % hits['n'])
+        finally:
+            WeChatUIA._warn_gate_blocked = o_warn
+            ud.win32gui, ud._HAS_WIN32 = o_gui2, o_has2
+    finally:
+        ud.wxlog, ud._GATE_BLOCK_WARNED = o_log, o_set
+    check("wxlog 与去重集合已还原", ud.wxlog is not c and isinstance(ud._GATE_BLOCK_WARNED, set))
+
+    print("[tree] ensure_window 的兜底分支也不再静默")
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "wechatauto", "uia_driver.py"), encoding="utf-8").read()
+    i = src.index("def ensure_window(")
+    seg = src[i:src.index("\n    def ", i + 1)]
+    j = seg.index("else:")
+    check("走「读屏标志 + wake」之前先给出诊断（32 位就是这么被误判成屏蔽的）",
+          "_warn_gate_blocked" in seg[j:], seg[j:j + 90].strip())
+    k = src.index("def ensure_materialized(")
+    seg2 = src[k:src.index("\n    def ", k + 1)]
+    check("ensure_materialized 的早退分支也带诊断",
+          "_warn_gate_blocked" in seg2 and "self._wechat_hwnds(scan)" in seg2)
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
          "gate": t_gate, "click": t_click, "listen": t_listen, "moment": t_moment,
-         "sender": t_sender, "voice": t_voice,
+         "sender": t_sender, "voice": t_voice, "tree": t_tree,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
     want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click", "listen",
-                            "moment", "sender", "voice", "keys", "sessions", "messages"]
+                            "moment", "sender", "voice", "tree",
+                            "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)
         if not fn:
