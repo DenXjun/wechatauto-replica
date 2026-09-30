@@ -771,6 +771,34 @@ class MediaDownloader:
         left, right = rect.left + off, rect.right - off
         return [right, left] if is_self else [left, right]
 
+    def _sent_by_self(self, row) -> bool:
+        """这条消息是不是本机账号自己发的。
+
+        ``real_sender_id`` 是 ``message_resource.db`` 里 ``SenderName2Id`` 的 rowid，
+        **本机账号落在哪个 rowid 不是一定的**：代码里原本写死 ``== 2``（1.1.8 从
+        别人那台机器带过来的取值），本机实测自己是 1——文件传输助手 400 条消息
+        全是 ``sender_id=1``，而 ``SenderName2Id`` 里解析成本机 wxid 的 rowid 也是 1，
+        ``2`` 反而是某个常联系的好友（图片消息里有 512 条）。写错这一条的代价很直接：
+        自己发的图被当成别人发的，先去点左边那块，永远点不中气泡，看起来就是
+        「我发的图片提示找不到原图」。
+        """
+        sid = row.get("sender_id")
+        if sid is None:
+            sid = row.get("real_sender_id")
+        try:
+            sid = int(sid)
+        except (TypeError, ValueError):
+            return False
+        own = ""
+        try:
+            own = (getattr(self.db, "wxid", "") or "").strip()
+            who = self.db._sender_id_index().get(sid)
+        except Exception:
+            who = None
+        if own and who:
+            return who == own
+        return sid == 1                  # 索引没覆盖（多库账号）时兜底：自己一般是 1
+
     # 预览窗的顶层形状实测有两种（同一台机、同一个微信版本）：
     #   ① 桌面的直接子节点就是 ``mmui::PreviewWindow``（Name 是 'Weixin'）；
     #   ② 顶层是 ``Qt51514QWindowIcon``、标题「图片和视频」，``mmui::PreviewWindow``
@@ -1162,46 +1190,132 @@ class MediaDownloader:
                 if p not in before or before[p][0] < mt - 1e-6]
 
     @staticmethod
-    def _save_dialog():
-        """找「另存为」对话框（Win32 通用类 #32770），返回控件或 None。"""
-        import uiautomation as auto
-        try:
-            for w in auto.GetRootControl().GetChildren():
-                if (w.ClassName or "") == "#32770" and w.Name and \
-                        any(k in w.Name for k in ("另存", "保存为", "Save As")):
-                    return w
-        except Exception:
-            pass
+    def _find_by_name(ctrl, pred, max_depth=14, _d=0):
+        """深度优先找第一个 Name 满足 ``pred`` 的控件。"""
+        if _d > max_depth:
+            return None
+        for k in ctrl.GetChildren():
+            try:
+                if pred((k.Name or "").strip()):
+                    return k
+            except Exception:
+                continue
+            got = MediaDownloader._find_by_name(k, pred, max_depth, _d + 1)
+            if got is not None:
+                return got
         return None
 
-    def _fill_save_dialog(self, dlg, target):
-        """在「另存为」里填路径并点保存：用 ValuePattern + UIA Invoke，**不发键盘**。
+    @staticmethod
+    def _save_dialog():
+        """找微信「保存」弹出的 Windows 通用另存为对话框。
 
-        填不进去或找不到「保存」按钮就返回 False（调用方保留对话框，不硬点别的东西）。
+        实机结构：顶层类名 ``#32770``，但**标题是「保存」而不是「另存为」**——
+        按标题里有没有「另存」去匹配会认不出。判据改成「``#32770`` + 里面有以
+        「保存」开头的按钮」，标题只当辅助。
         """
         import uiautomation as auto
-        edits, btns = [], []
+        try:
+            tops = auto.GetRootControl().GetChildren()
+        except Exception:
+            return None
+        for w in tops:
+            try:
+                if (w.ClassName or "") != "#32770":
+                    continue
+                if MediaDownloader._find_by_name(
+                        w, lambda n: n.startswith("保存")) is None:
+                    continue
+                return w
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _dialog_button(dlg, names):
+        """对话框里文案以 ``names`` 任一开头的按钮（``保存(S)`` 带助记符后缀）。"""
+        return MediaDownloader._find_by_name(
+            dlg, lambda n: any(n == x or n.startswith(x + "(") or n == x + "(S)"
+                               for x in names))
+
+    @staticmethod
+    def _first_edit(root, skip_search=True, max_depth=14):
+        """子树里第一个 Edit（默认跳过「搜索框」）。
+
+        对话框刚关掉/切页时 UIA 树会在遍历中途失效，读一颗节点的属性就抛——那种
+        节点跳过就好，不能把异常抛出整条「保存」路线。
+        """
+        found = []
 
         def walk(c, d=0):
-            if d > 8:
+            if d > max_depth:
                 return
-            for k in c.GetChildren():
-                ct = k.ControlTypeName or ""
-                if "Edit" in ct:
-                    edits.append(k)
-                elif "Button" in ct and (k.Name or "").strip() in ("保存(S)", "保存", "确定", "Save"):
-                    btns.append(k)
+            try:
+                kids = list(c.GetChildren())
+            except Exception:
+                return
+            for k in kids:
+                try:
+                    is_edit = "Edit" in (k.ControlTypeName or "")
+                except Exception:
+                    is_edit = False
+                if is_edit:
+                    found.append(k)
                 walk(k, d + 1)
 
-        walk(dlg)
-        if not edits or not btns:
+        walk(root)
+        for e in found:
+            try:
+                blob = (e.Name or "") + " " + (e.ClassName or "")
+            except Exception:
+                blob = ""
+            if skip_search and "搜索" in blob:
+                continue
+            return e
+        return None
+
+    @staticmethod
+    def _file_name_edit(dlg):
+        """文件名输入框：优先 Name 含「文件名」。
+
+        实机对话框里还有一个 ``Name='搜索框'`` 的 Edit（右上角搜索栏），拿「第一个
+        Edit」会填到那里去；而且「文件名:」在树上出现**两层**——外层是
+        ``ComboBoxControl(Name='文件名:')``，真正可写值的是它里面那个
+        ``EditControl(Name='文件名:')``，所以命中容器之后还要再往里找 Edit。
+        """
+        hit = MediaDownloader._find_by_name(dlg, lambda n: "文件名" in n)
+        if hit is not None:
+            if "Edit" in (hit.ControlTypeName or ""):
+                return hit
+            inner = MediaDownloader._first_edit(hit)
+            if inner is not None:
+                return inner
+        return MediaDownloader._first_edit(dlg)
+
+    def _fill_save_dialog(self, dlg, target):
+        """在「保存」对话框里填完整路径并点 ``保存(S)``：ValuePattern + UIA Invoke，
+        **不发键盘**。填不进/找不到按钮返回 False（调用方负责点「取消」收尾）。"""
+        edit = self._file_name_edit(dlg)
+        btn = self._dialog_button(dlg, ("保存", "Save"))
+        if edit is None or btn is None:
             return False
         try:
-            edits[0].GetValuePattern().SetValue(target)
+            edit.GetValuePattern().SetValue(target)
         except Exception:
             return False
         try:
-            btns[0].GetInvokePattern().Invoke()
+            btn.GetInvokePattern().Invoke()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _cancel_save_dialog(dlg):
+        """点「取消」收尾：模态框不关掉会一直挡着预览窗，后面每张都失败。"""
+        btn = MediaDownloader._dialog_button(dlg, ("取消", "Cancel"))
+        if btn is None:
+            return False
+        try:
+            btn.GetInvokePattern().Invoke()
             return True
         except Exception:
             return False
@@ -1209,11 +1323,11 @@ class MediaDownloader:
     def _save_via_button(self, win, save_dir, stem, deadline, t0):
         """点预览窗的「保存」，把微信写出的明文图片收进 ``save_dir``。
 
-        实测这台机上没有 ``temp/RWTemp`` 那种明文产物（那是 #30 报告人机器上的路径），
-        所以落点只能靠「点之前拍快照、点之后找新文件」来发现；如果微信弹的是
-        「另存为」，就直接把目标路径填进去，省掉再搬一次。
-
-        返回落盘路径，或 ``None``（没找到按钮 / 没出现新文件 / 超时）。
+        实机确认：微信「保存」**弹的是 Windows 通用另存为对话框**（标题「保存」，
+        默认目录 ``temp\\InputTemp``，文件名预填 ``微信图片_YYYYMMDDHHMMSS_***.jpg``），
+        不是静默落盘，所以路径不固定——直接把目标全路径填进「文件名:」再点「保存(S)」，
+        一步到位。万一以后版本改成静默保存，仍然用「点之前拍快照、点之后找新文件」兜底。
+        **任何失败路径都会点「取消」把模态框关掉**，不留在屏幕上挡事。
         """
         btn = self._find_preview_button(win, "保存")
         if btn is None:
@@ -1239,24 +1353,30 @@ class MediaDownloader:
                 return None
         target = self._out(save_dir, stem + ".jpg")
         until = min(deadline, time.time() + 12.0)
-        dlg_handled = False
+        dialog_seen = False
         while time.time() < until:
             dlg = self._save_dialog()
-            if dlg is not None and not dlg_handled:
-                dlg_handled = True
+            if dlg is not None:
+                dialog_seen = True
                 if self._fill_save_dialog(dlg, target):
-                    wxlog.debug("「另存为」已填目标路径并点保存")
-                    time.sleep(1.0)
-                    if os.path.isfile(target) and os.path.getsize(target) > 0:
-                        return target
-            new = self._new_images(before,
-                                   {p: v for r in roots for p, v in
-                                    self._recent_images(r, since).items()})
+                    wxlog.debug("已在「保存」对话框里填好目标路径并点「保存(S)」")
+                    end = time.time() + 8.0
+                    while time.time() < end:
+                        if os.path.isfile(target) and os.path.getsize(target) > 0:
+                            return target
+                        time.sleep(0.4)
+                    wxlog.warning("点了「保存(S)」，但目标目录里没出现该文件：%s",
+                                  os.path.dirname(target))
+                else:
+                    wxlog.warning("「保存」对话框里找不到「文件名:」输入框或「保存(S)」按钮")
+                self._cancel_save_dialog(dlg)
+                return None
+            new = self._new_images(
+                before, {p: v for r in roots
+                         for p, v in self._recent_images(r, since).items()})
             if new:
                 src = max(new, key=lambda p: (os.path.getmtime(p)
                                               if os.path.exists(p) else 0))
-                if os.path.abspath(src) == os.path.abspath(target):
-                    return target
                 try:
                     with open(src, "rb") as f:
                         data = f.read()
@@ -1270,9 +1390,11 @@ class MediaDownloader:
                 except OSError as e:
                     wxlog.debug("复制保存产物失败：%s", e)
                 return None
-            time.sleep(0.6)
-        wxlog.debug("点了「保存」但没发现新文件（12 秒内）")
+            time.sleep(0.5)
+        wxlog.warning("点了「保存」之后既没出现对话框、也没有新文件（12 秒）"
+                      if not dialog_seen else "「保存」对话框处理完仍然没有文件")
         return None
+
 
     def _voice_index(self, user: str):
         """该会话在各 media 分片里的 ``(chat_name_id, svr_id) -> 音频字节数``。
@@ -1540,6 +1662,13 @@ class MediaDownloader:
             解密后的原图路径（文件名沿用 ``<user>_<local_id>.<ext>``，不加档位后缀，
             与老版本一致）；拿不到返回 ``None``，并打一条说明**卡在哪一步**的日志。
             本机三档的实际情况随时可以用 :meth:`image_status` 查到。
+
+            有一种 ``None`` 是**不需要走界面就知道结论**的：这条图是自己发出去的、
+            本机只有压缩版 ``.dat``。实测 554 条自发图片里只有 19 条带 ``_h.dat``，
+            而那 19 条都没有 ``.dat``（只有发的时候勾了「原图」才留原件），所以这种
+            图点界面也点不出更大的东西来——直接返回 ``None``，日志指引
+            ``download_image(tier='best')``。连 ``.dat`` 都没有的例外，打开预览会
+            让微信把压缩版下载下来，那种仍然会走一轮界面。
         """
         row = self.db.get_message_row(user, local_id, local_type=3)
         if not row or row["local_type"] != 3:
@@ -1570,6 +1699,17 @@ class MediaDownloader:
             if data:
                 wxlog.warning("_h.dat 解密后缺 JPEG/PNG 收尾标记（下到一半），"
                               "按「没下完」处理，改走界面触发：%d 字节", len(data))
+
+        if not hit and mid_sz and self._sent_by_self(row):
+            # 自己发出去的图，本机一般不存在「比 .dat 更大的一档」：实测 554 条自发
+            # 图片消息里只有 19 条带 _h.dat，而那 19 条**都没有** .dat——只有发的时候
+            # 勾了「原图」才留原件，留了原件就不再另存压缩版。剩下 527 条能拿到的最好
+            # 一份就是本地 .dat，解密即得，没必要（也不该）为它去点一轮界面。
+            wxlog.info("这条图是自己发出去的，本机没有 _h.dat 这一档（实测 554 条自发"
+                       "图片里只有 19 条有，而且那 19 条都没有 .dat）。要本机最好的那份"
+                       "请用 download_image(tier='best')——直接解密 .dat，一步界面都不碰；"
+                       "要原始字节只能重发一次并勾「原图」。")
+            return None
 
         from .uia_driver import WeChatUIA
         from .guia import WinInput
@@ -1711,7 +1851,7 @@ class MediaDownloader:
                     [(ch, ch.BoundingRectangle.top) for ch in images], n_newer)
                 wxlog.debug("没认出具体哪一行（%s）：目标下面有 %d 张更新的图，可视气泡 %d 个，"
                             "按此排定尝试顺序", note, n_newer, len(order))
-            is_self = (row.get("sender_id") == 2)
+            is_self = self._sent_by_self(row)
             # 屏幕上已经开着预览窗时，「有没有新窗口」这个判据会失真（实测撞上过一次
             # 假成功），所以记下已有句柄，只把**新出现**的窗口算作点开。
             before = {h for h, _w in self._preview_windows()}

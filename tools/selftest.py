@@ -1580,7 +1580,7 @@ def t_image() -> None:
           mdn.image_status('x', 1)['reason'] == 'no_md5')
 
     print("[image] 分档取文件")
-    JPEG = b"\xff\xd8\xff" + b"J" * 64
+    JPEG = b"\xff\xd8\xff" + b"J" * 61 + b"\xff\xd9"
 
     def stub_decrypt(md, keep=None):
         def _d(path, aes_key=None, xor_key=None):
@@ -2017,7 +2017,7 @@ def t_image() -> None:
             return []
 
     class Edit(Node):
-        ControlTypeName, Name = "EditControl", ""
+        ClassName, ControlTypeName, Name = "Edit", "EditControl", ""
 
         def __init__(self):
             self.value = None
@@ -2064,37 +2064,141 @@ def t_image() -> None:
           MediaDownloader._find_preview_button(
               zoom_tree, MediaDownloader.ZOOM_REQUEST) is None)
 
-    ed, bt = Edit(), DlgBtn("保存(S)")
-    dlg = Dlg([Dlg([ed]), Dlg([bt])])
-    check("「另存为」用 ValuePattern 填路径 + UIA 点保存，全程不发键盘",
-          ms._fill_save_dialog(dlg, r"D:\out\pic.jpg") is True
-          and ed.value == r"D:\out\pic.jpg" and bt.invoked == 1,
-          "%r %s" % (ed.value, bt.invoked))
-    check("对话框里没有保存按钮时不硬来",
-          ms._fill_save_dialog(Dlg([Dlg([Edit()])]), r"D:\out\p.jpg") is False)
+    # 实机 dump 出来的「保存」对话框结构（顶层类名 #32770，**标题就是「保存」**）：
+    #   AppControlHost ComboBox name='文件名:' → Edit name='文件名:'（可写值）
+    #   SearchEditBox          Edit name='搜索框'   ← 拿「第一个 Edit」会填到这里
+    #   Button name='保存(S)' / Button name='取消'（窗口直接子节点）
+    class FileNameEdit(Edit):
+        Name = "文件名:"
 
-    class FakeRoot2:
-        def __init__(self, kids):
-            self._k = kids
+    class SearchEdit(Edit):
+        ClassName, Name = "SearchEditBox", "搜索框"
+
+    class Combo(Node):
+        ControlTypeName = "ComboBoxControl"
+
+        def __init__(self, name, kids=()):
+            self.Name, self._k = name, list(kids)
 
         def GetChildren(self):
             return self._k
 
-    class Top:
-        def __init__(self, cls, name):
-            self.ClassName, self.Name = cls, name
+    class SaveDlg(Node):
+        ClassName, ControlTypeName, Name = "#32770", "WindowControl", "保存"
 
-    _orig_root2 = _auto.GetRootControl
+        def __init__(self, kids):
+            self._k = list(kids)
+
+        def GetChildren(self):
+            return self._k
+
+    fn_edit = FileNameEdit()
+    btn_save, btn_cancel = DlgBtn("保存(S)"), DlgBtn("取消")
+    dlg = SaveDlg([Combo("文件名:", [fn_edit]), SearchEdit(), btn_save, btn_cancel])
+    check("文件名框按 Name 挑，不会填进右上角那个「搜索框」Edit",
+          MediaDownloader._file_name_edit(dlg) is fn_edit,
+          str(MediaDownloader._file_name_edit(dlg)))
+    check("按钮按前缀匹配（实机文案带助记符「保存(S)」）",
+          MediaDownloader._dialog_button(dlg, ("保存", "Save")) is btn_save
+          and MediaDownloader._dialog_button(dlg, ("取消", "Cancel")) is btn_cancel)
+    check("填路径 + 点「保存(S)」全程用 ValuePattern/Invoke，不发键盘",
+          ms._fill_save_dialog(dlg, r"D:\out\pic.jpg") is True
+          and fn_edit.value == r"D:\out\pic.jpg" and btn_save.invoked == 1,
+          "%r %s" % (fn_edit.value, btn_save.invoked))
+    check("失败收尾会点「取消」把模态框关掉（不留在屏幕上挡预览窗）",
+          MediaDownloader._cancel_save_dialog(dlg) is True and btn_cancel.invoked == 1)
+    check("对话框里没有文件名框时不硬来",
+          ms._fill_save_dialog(SaveDlg([SearchEdit(), DlgBtn("保存(S)")]),
+                               r"D:\out\p.jpg") is False)
+
+    # 对话框刚关/切页时 UIA 树会在遍历中途失效：读属性、取子节点都可能抛。
+    # 这类异常一旦抛出去就把整条「保存」兜底路线打死（上一轮真机就是被一个
+    # NameError 打死的），所以必须一支节点坏了就跳过那一支。
+    class Boom(Node):
+        ClassName, ControlTypeName, Name = "Pane", "PaneControl", ""
+
+        def GetChildren(self):
+            raise RuntimeError("控件已失效")
+
+    class BrokenEdit(Edit):
+        @property
+        def ClassName(self):
+            raise RuntimeError("控件已失效")
+
+    got_e = MediaDownloader._first_edit(SaveDlg([Boom(), SearchEdit(), fn_edit]))
+    check("一支子树遍历失败 → 跳过它继续找，仍然拿到文件名框",
+          got_e is fn_edit, str(got_e))
+    check("Edit 自身属性读取抛 → 不炸出去（宁可当成可填的框）",
+          MediaDownloader._first_edit(SaveDlg([BrokenEdit()])) is not None)
+    _orig_root3 = _auto.GetRootControl
+
+    class Top(Node):
+        def __init__(self, cls, name, kids=()):
+            self.ClassName, self.Name = cls, name
+            self._k = list(kids)
+            self.NativeWindowHandle = id(self)
+
+        def GetChildren(self):
+            return self._k
+
+    class RootOf:
+        def __init__(self, kids):
+            self._k = list(kids)
+
+        def GetChildren(self):
+            return self._k
+
     try:
-        _auto.GetRootControl = lambda: FakeRoot2([
-            Top("#32770", "另存为"), Top("Qt51514QWindowIcon", "微信")])
-        d = MediaDownloader._save_dialog()
-        check("认得出「另存为」对话框（按 #32770 + 标题）",
-              d is not None and d.Name == "另存为", str(d and d.Name))
-        _auto.GetRootControl = lambda: FakeRoot2([Top("#32770", "属性")])
-        check("别的系统对话框不算", MediaDownloader._save_dialog() is None)
+        _auto.GetRootControl = lambda: RootOf([Top("Qt51514QWindowIcon", "微信"),
+                                               Top("#32770", "保存", [dlg])])
+        check("标题是「保存」而不是「另存为」的对话框也认得（按类名+保存按钮）",
+              MediaDownloader._save_dialog() is not None)
+        _auto.GetRootControl = lambda: RootOf([Top("#32770", "属性", [Node()])])
+        check("没有「保存」按钮的 #32770 不算（别的应用的通用对话框）",
+              MediaDownloader._save_dialog() is None)
     finally:
-        _auto.GetRootControl = _orig_root2
+        _auto.GetRootControl = _orig_root3
+
+    print("[image] 「保存」对话框端到端（假对话框真写文件）")
+    made = ms.save_dir
+
+    class SaveToFileBtn(DlgBtn):
+        def __init__(self, name, edit):
+            DlgBtn.__init__(self, name)
+            self.edit = edit
+
+        def Invoke(self):
+            self.invoked += 1
+            if self.edit.value:
+                with open(self.edit.value, "wb") as f:
+                    f.write(JPG)
+
+    fn2 = FileNameEdit()
+    ok_btn = SaveToFileBtn("保存(S)", fn2)
+    dlg2 = SaveDlg([Combo("文件名:", [fn2]), SearchEdit(), ok_btn, DlgBtn("取消")])
+    ms3 = MediaDownloader.__new__(MediaDownloader)
+    ms3.db = AccDB()
+    ms3.save_dir = tempfile.mkdtemp(prefix='wxdlg-')
+    tmpdirs.append(ms3.save_dir)
+    ms3._find_preview_button = lambda w, name: (DlgBtn("保存") if name == "保存" else None)
+    ms3._save_dialog = staticmethod(lambda: dlg2)
+    got3 = ms3._save_via_button(Win(), ms3.save_dir, "wxid_img_7",
+                                _time.time() + 25, _time.time())
+    check("点「保存」→ 对话框里填目标路径 → 文件真的落在 save_dir 并返回该路径",
+          got3 and got3.endswith("wxid_img_7.jpg") and _os.path.isfile(got3)
+          and ok_btn.invoked == 1, "%s 按钮点了 %d 次" % (got3, ok_btn.invoked))
+    ms4 = MediaDownloader.__new__(MediaDownloader)
+    ms4.db = AccDB()
+    ms4.save_dir = tempfile.mkdtemp(prefix='wxdlg2-')
+    tmpdirs.append(ms4.save_dir)
+    cancelled = DlgBtn("取消")
+    bad_dlg = SaveDlg([SearchEdit(), DlgBtn("保存(S)"), cancelled])
+    ms4._find_preview_button = lambda w, name: (DlgBtn("保存") if name == "保存" else None)
+    ms4._save_dialog = staticmethod(lambda: bad_dlg)
+    got4 = ms4._save_via_button(Win(), ms4.save_dir, "x", _time.time() + 8, _time.time())
+    check("对话框里挑不到文件名框 → 返回 None 并且点了「取消」收尾",
+          got4 is None and cancelled.invoked == 1,
+          "%s 取消点了 %d 次" % (got4, cancelled.invoked))
 
     print("[image] verify=True 时按结构判完整")
     mv._image_files = lambda u, m: {"original": (new_jpg, 5000)}
@@ -2249,8 +2353,12 @@ def t_image() -> None:
             self.BoundingRectangle = R(700, 40, 2300, 1700)
 
     class RowDB:
-        def __init__(self, sender):
-            self.sender = sender
+        def __init__(self, sender, own=None, index=None):
+            self.sender, self.wxid = sender, own
+            self._index = dict(index or {})
+
+        def _sender_id_index(self):
+            return dict(self._index)
 
         def get_message_row(self, u, lid, local_type=None):
             return {"local_type": 3, "create_time": 1, "sort_seq": 50,
@@ -2277,16 +2385,27 @@ def t_image() -> None:
     saved_calls = []
 
     def smoke(sender, pid_ok=True, has_button=True, chat=None, pre_open=False,
-              zoom="request", h_dat=True, save_returns=None):
-        """zoom: request=「图片原始大小」/ shown=「图片适应窗口大小」/ none=找不到那颗键"""
+              zoom="request", h_dat=True, save_returns=None,
+              tiers="none", own=None, index=None):
+        """zoom: request=「图片原始大小」/ shown=「图片适应窗口大小」/ none=找不到那颗键
+
+        tiers: 本机附件目录里有哪些档（none=什么都没有 / mid=只有压缩版 /
+               thumb=只有缩略图 / h=有 _h.dat）
+        """
         FakeGui.pid = 4321 if pid_ok else None
         FakeUIA.no_hwnd = not pid_ok
         FakeUIA.chat = chat
         ms = MediaDownloader.__new__(MediaDownloader)
         ms.save_dir = tempfile.mkdtemp(prefix='wxsmoke-')
         tmpdirs.append(ms.save_dir)
-        ms.db = RowDB(sender)
-        ms._image_files = lambda u, m: {}          # 本机没有原图 → 必须走界面
+        ms.db = RowDB(sender, own, index)
+        # _h.dat 走「界面」这条路的前提是本机没有合格的原图档
+        ms._image_files = lambda u, m: dict({
+            "none": {},
+            "mid": {"mid": ("C:\\tmp\\x.dat", 5000)},
+            "thumb": {"thumbnail": ("C:\\tmp\\x_t.dat", 900)},
+            "h": {"original": ("C:\\tmp\\x_h.dat", 5000),
+                  "mid": ("C:\\tmp\\x.dat", 900)}}[tiers])
         ms._visible_rows = lambda lst: [("image", "图片", Ctl(700)),
                                         ("text", "正文一行", Ctl(950))]
         zoom_btn = FakeBtn({"request": "图片原始大小",
@@ -2346,8 +2465,20 @@ def t_image() -> None:
           plans and plans[-1] > 0, str(plans))
     clicks.clear()
     smoke(2, chat="显示名")
-    check("自己发的（sender_id==2）：先点右边 x=2753",
+    check("sender_id=2 不再当成「自己发的」（本机实测 2 是某个常联系的好友，512 条图）",
+          clicks and clicks[0][0] == 777, str(clicks[:2]))
+    clicks.clear()
+    smoke(1, chat="显示名")
+    check("自己发的（sender_id=1，文件传输助手 400 条全是它）：先点右边 x=2753",
           clicks and clicks[0][0] == 2753, str(clicks[:2]))
+    clicks.clear()
+    smoke(7, chat="显示名", own="wxid_me", index={7: "wxid_me", 1: "wxid_other"})
+    check("按 SenderName2Id 解析判「是不是我发的」，不写死常数（别人那台机器 rowid 是 7）",
+          clicks and clicks[0][0] == 2753, str(clicks[:2]))
+    clicks.clear()
+    smoke(1, chat="显示名", own="wxid_me", index={7: "wxid_me", 1: "wxid_other"})
+    check("解析出来是别人就当别人（哪怕 sender_id==1）",
+          clicks and clicks[0][0] == 777, str(clicks[:2]))
     check("行中心取的是那一行的中线", clicks and clicks[0][1] == 700 + 123, str(clicks[:1]))
     chatwith.clear()
     smoke(None, chat="别的会话")
@@ -2356,6 +2487,29 @@ def t_image() -> None:
     smoke(None, chat=None)
     check("读不到当前会话标题时也照常进入（保守：宁可多搜一次）",
           chatwith == ["显示名"], str(chatwith))
+
+    # 「我发的图片提示找不到原图」的真相：自己发出去的图本机一般没有 _h.dat
+    # （实测 554 条自发图片里只有 19 条有，而那 19 条都没有 .dat）。为这种图去点
+    # 一轮界面没有任何收益，还平白多一次真实界面动作——直接返回 None 并说明办法。
+    clicks.clear()
+    chatwith.clear()
+    out_mid, _b = smoke(1, chat="显示名", tiers="mid")
+    check("自己发的 + 本机只有压缩版 → 直接 None，一次界面都不碰",
+          out_mid is None and not clicks and not chatwith,
+          "%s 点击=%s 搜索=%s" % (out_mid, clicks, chatwith))
+    clicks.clear()
+    out_thumb, _b2 = smoke(1, chat="显示名", tiers="thumb")
+    check("自己发的但连 .dat 都没有 → 仍然走界面（打开预览会让微信把压缩版下下来）",
+          bool(clicks), str(clicks[:1]))
+    clicks.clear()
+    smoke(None, chat="显示名", tiers="mid")
+    check("别人发的 + 只有压缩版 → 照常走界面（这才是「点一下就能下原图」的那种）",
+          bool(clicks), str(clicks[:1]))
+    clicks.clear()
+    chatwith.clear()
+    out_h, _b3 = smoke(None, chat="显示名", tiers="h")
+    check("本机已有合格 _h.dat → 不碰界面，直接解密落盘",
+          out_h is not None and not clicks and not chatwith, "%s %s" % (out_h, clicks))
     plans.clear()
     smoke(None, pid_ok=False, chat="显示名")
     check("拿不到进程 id → 绝不滚界面（max_scrolls=0，落点无法校验）",
