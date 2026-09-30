@@ -48,33 +48,34 @@ def main():
 
     success = 0
     for i, local_id in enumerate(image_ids, 1):
-        print(f"\n[{i}/{len(image_ids)}] 下载图片 local_id={local_id}...")
+        print(f"\n[{i}/{len(image_ids)}] 图片 local_id={local_id}...")
 
-        # 先尝试直接下载（如果原图已存在且大于100KB）
-        import os
-        out = md.download_image(chat_name, local_id, save_dir=args.save_dir)
-        if out and "_thumb" not in out and os.path.getsize(out) > 102400:
-            print(f"  ✓ 图片已存在: {out}")
-            success += 1
-            continue
+        # 先问一句本机有哪一档：以前这里用「文件大于 100KB」当原图判据，
+        # 而真原图中位数只有 91.5KB——一半会把压缩版当成原图、把原图当成没下完。
+        st = md.image_status(chat_name, local_id)
+        print(f"  本机档位: {st['tiers'] or '无'} reason={st['reason']}")
+        if st["reason"] == "ok":
+            out = md.download_image(chat_name, local_id, save_dir=args.save_dir,
+                                    tier="original")
+            if out:
+                print(f"  ✓ 原图已在本地，直接解密: {out}")
+                success += 1
+                continue
 
-        # 原图不存在，通过UI点击触发下载
-        print(f"  原图不存在，通过UI点击触发下载...")
+        # 本机没有原图，通过UI点击触发微信下载
+        print("  本机没有原图，通过UI点击触发下载...")
         out = md.download_image_original(
             chat_name, local_id,
             save_dir=args.save_dir,
             timeout=args.timeout,
             chat_name=args.chat
         )
-        print(out)
         if out:
-            if "_thumb" not in out:
-                print(f"  ✓ 原图下载成功: {out}")
-                success += 1
-            else:
-                print(f"  ⚠ 下载的是缩略图: {out}")
+            print(f"  ✓ 原图下载成功: {out}")
+            success += 1
         else:
-            print(f"  ✗ 下载失败")
+            st2 = md.image_status(chat_name, local_id)
+            print(f"  ✗ 下载失败（现在档位: {st2['tiers'] or '无'} reason={st2['reason']}）")
 
     print(f"\n完成: {success}/{len(image_ids)} 张原图下载成功")
 
