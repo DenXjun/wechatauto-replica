@@ -1511,18 +1511,34 @@ def t_image() -> None:
         md._tmp = d
         return md
 
-    print("[image] 原图「下好了没」的判据")
+    print("[image] 原图「在不在、完不完整」的判据")
     orr = MediaDownloader.original_ready
-    check("非空且不比压缩版小 → 算原图", orr(90000, 95000) is True)
+    ic = MediaDownloader._image_complete
+    check("非空且过下限就算原图", orr(90000, 95000) is True)
     check("40KB 的小截图原图照样算（旧的 >100KB 硬门槛会误杀）",
           orr(40000, 30000) is True and orr(40000, None) is True,
           "%s %s" % (orr(40000, 30000), orr(40000, None)))
-    check("恰好卡在 90% 线上/线下", orr(90000, 100000) is True
-          and orr(89999, 100000) is False)
-    check("0 字节半截文件不算", orr(0, 45000) is False and orr(None, 45000) is False)
-    check("比压缩版小一半 → 不算（下载没完成）", orr(50000, 400000) is False)
-    check("没有压缩版可比时只看下限", orr(40000, None) is True
-          and orr(10, None) is False)
+    # 1.2.4.2 的比例判据被实机否掉了：同一张图的 .dat 有时就是比 _h.dat 大
+    check("比压缩版小也算原图（尺寸比例不是判据——用户实机证明）",
+          orr(3503, 6351) is True and orr(89520, 109530) is True,
+          "%s %s" % (orr(3503, 6351), orr(89520, 109530)))
+    check("mid_size 传什么都不影响结论（参数留着只为不改已发布的签名）",
+          orr(5000, 999999) is True and orr(5000) is True)
+    check("0 字节 / None 不算", orr(0, 45000) is False and orr(None, 45000) is False)
+    check("下限只挡空壳", orr(10, None) is False and orr(1024, None) is True)
+    JPG = b"\xff\xd8\xff" + b"j" * 60 + b"\xff\xd9"
+    check("JPEG 有 FF D9 收尾算完整", ic(JPG) is True)
+    check("JPEG 被截断（没有收尾标记）算不完整",
+          ic(b"\xff\xd8\xff" + b"j" * 80) is False)
+    check("JPEG 收尾后带填充字节仍算完整（微信会追加页脚）",
+          ic(b"\xff\xd8\xff" + b"j" * 40 + b"\xff\xd9" + b"\0" * 20) is True)
+    check("PNG 看 IEND",
+          ic(b"\x89PNG\r\n\x1a\n" + b"p" * 40 + b"IEND\xaeB`\x82") is True
+          and ic(b"\x89PNG\r\n\x1a\n" + b"p" * 40) is False)
+    check("GIF 看结束符 0x3B", ic(b"GIF89a" + b"g" * 40 + b"\x3b\x00") is True)
+    check("认不出格式的不否决（wxgf/动画表情等，误杀比重演更糟）",
+          ic(b"wxgf" + b"z" * 60) is True)
+    check("太短的字节直接算不完整", ic(b"\xff\xd8") is False and ic(None) is False)
 
     print("[image] 三档状态报告")
     md = newmd({'original': 200000, 'mid': 100000, 'thumb': 5000})
@@ -1641,12 +1657,19 @@ def t_image() -> None:
     seq = [p0, p0, p1, p1]
     mw = MediaDownloader.__new__(MediaDownloader)
     mw._find_h_dat = lambda u, m: seq.pop(0) if seq else p1
-    got = mw._wait_h_dat('u', MD5, mid_sz=50000, until=_time.time() + 6)
+    got = mw._wait_h_dat('u', MD5, until=_time.time() + 6)
     check("先 0 后 60000 且稳定 → 判定下完", got is not None and got[1] == 60000, str(got))
     mw2 = MediaDownloader.__new__(MediaDownloader)
     mw2._find_h_dat = lambda u, m: p0
     check("一直是 0 字节 → 到点返回 None（不返回半截文件）",
-          mw2._wait_h_dat('u', MD5, mid_sz=50000, until=_time.time() + 0.1) is None)
+          mw2._wait_h_dat('u', MD5, until=_time.time() + 0.1) is None)
+    small = _os.path.join(tdir, 'small.dat')
+    open(small, 'wb').write(b'\0' * 3000)          # 比压缩版小，但已经不再变化
+    mw3 = MediaDownloader.__new__(MediaDownloader)
+    mw3._find_h_dat = lambda u, m: small
+    got3 = mw3._wait_h_dat('u', MD5, until=_time.time() + 3)
+    check("尺寸不再变化就算下完（不再拿它和压缩版比大小）",
+          got3 is not None and got3[1] == 3000, str(got3))
 
     print("[image] db.get_image_rows 带出 packed_info")
     conn = sqlite3.connect(':memory:')
@@ -1925,6 +1948,154 @@ def t_image() -> None:
     check("每格只滚半行时按实测修正：第二圈要滚 2 格而不是 1 格",
           note7 == "aligned-after-2" and wr7.calls == [(-120, 2), (-120, 2)],
           "%s %s" % (note7, wr7.calls))
+
+    print("[image] 「保存」兜底：预览窗那颗按钮真的能拿回文件")
+    import uiautomation as _auto
+    acc = tempfile.mkdtemp(prefix='wxacc-')
+    tmpdirs.append(acc)
+    sub = os.path.join(acc, "msg", "attach", "c1", "2026-09")
+    os.makedirs(sub)
+    old_jpg = os.path.join(sub, "old.jpg")
+    open(old_jpg, "wb").write(b"\xff\xd8\xffold\xff\xd9")
+    os.utime(old_jpg, (_time.time() - 86400, _time.time() - 86400))
+    new_jpg = os.path.join(sub, "new.jpg")
+    open(new_jpg, "wb").write(JPG)
+    mv = MediaDownloader.__new__(MediaDownloader)
+    mv.save_dir = tempfile.mkdtemp(prefix='wxout-')
+    tmpdirs.append(mv.save_dir)
+
+    class AccDB:
+        account_dir = acc
+    mv.db = AccDB()
+    rec = mv._recent_images(acc, _time.time() - 60)
+    check("只收最近改过的图片，昨天的不算",
+          [os.path.basename(p) for p in rec] == ["new.jpg"], str(list(rec)))
+    check("新文件相对旧快照算「新增」，旧文件不算",
+          MediaDownloader._new_images({old_jpg: (1.0, 1)}, rec) == [new_jpg]
+          and MediaDownloader._new_images(rec, rec) == [],
+          str(MediaDownloader._new_images({old_jpg: (1.0, 1)}, rec)))
+
+    class SaveBtn:
+        def __init__(self, writes):
+            self.writes, self.n = writes, 0
+
+        def Click(self):
+            self.n += 1
+            with open(self.writes, "wb") as f:
+                f.write(JPG)
+
+    class Win:
+        pass
+
+    ms = MediaDownloader.__new__(MediaDownloader)
+    ms.db = AccDB()
+    ms.save_dir = tempfile.mkdtemp(prefix='wxout2-')
+    tmpdirs.append(ms.save_dir)
+    ms._find_preview_button = lambda w, name: (
+        SaveBtn(new_jpg) if name == "保存" else None)
+    ms._save_dialog = staticmethod(lambda: None)
+    got = ms._save_via_button(Win(), ms.save_dir, "wxid_img_7",
+                              _time.time() + 20, _time.time())
+    check("点「保存」后扫到新文件 → 收进 save_dir 并返回路径",
+          got and got.endswith("wxid_img_7.jpg") and _os.path.isfile(got)
+          and _os.path.getsize(got) == len(JPG), str(got))
+    ms2 = MediaDownloader.__new__(MediaDownloader)
+    ms2.db = AccDB()
+    ms2.save_dir = ms.save_dir
+    ms2._find_preview_button = lambda w, name: None
+    ms2._save_dialog = staticmethod(lambda: None)
+    check("预览窗里没有「保存」按钮时返回 None（不硬点别的东西）",
+          ms2._save_via_button(Win(), ms2.save_dir, "x", _time.time() + 5,
+                               _time.time()) is None)
+
+    class Node:
+        def GetChildren(self):
+            return []
+
+    class Edit(Node):
+        ControlTypeName, Name = "EditControl", ""
+
+        def __init__(self):
+            self.value = None
+
+        def GetValuePattern(self):
+            return self
+
+        def SetValue(self, v):
+            self.value = v
+
+    class DlgBtn(Node):
+        ControlTypeName = "ButtonControl"
+
+        def __init__(self, name):
+            self.Name, self.invoked = name, 0
+
+        def GetInvokePattern(self):
+            return self
+
+        def Invoke(self):
+            self.invoked += 1
+
+    class Dlg:
+        ControlTypeName, Name = "PaneControl", ""
+
+        def __init__(self, kids):
+            self._k = kids
+
+        def GetChildren(self):
+            return self._k
+
+    ed, bt = Edit(), DlgBtn("保存(S)")
+    dlg = Dlg([Dlg([ed]), Dlg([bt])])
+    check("「另存为」用 ValuePattern 填路径 + UIA 点保存，全程不发键盘",
+          ms._fill_save_dialog(dlg, r"D:\out\pic.jpg") is True
+          and ed.value == r"D:\out\pic.jpg" and bt.invoked == 1,
+          "%r %s" % (ed.value, bt.invoked))
+    check("对话框里没有保存按钮时不硬来",
+          ms._fill_save_dialog(Dlg([Dlg([Edit()])]), r"D:\out\p.jpg") is False)
+
+    class FakeRoot2:
+        def __init__(self, kids):
+            self._k = kids
+
+        def GetChildren(self):
+            return self._k
+
+    class Top:
+        def __init__(self, cls, name):
+            self.ClassName, self.Name = cls, name
+
+    _orig_root2 = _auto.GetRootControl
+    try:
+        _auto.GetRootControl = lambda: FakeRoot2([
+            Top("#32770", "另存为"), Top("Qt51514QWindowIcon", "微信")])
+        d = MediaDownloader._save_dialog()
+        check("认得出「另存为」对话框（按 #32770 + 标题）",
+              d is not None and d.Name == "另存为", str(d and d.Name))
+        _auto.GetRootControl = lambda: FakeRoot2([Top("#32770", "属性")])
+        check("别的系统对话框不算", MediaDownloader._save_dialog() is None)
+    finally:
+        _auto.GetRootControl = _orig_root2
+
+    print("[image] verify=True 时按结构判完整")
+    mv._image_files = lambda u, m: {"original": (new_jpg, 5000)}
+    mv.decrypt_image = lambda p, a=None, x=None: JPG
+    check("解密后完整 → ok",
+          mv._image_status_for("u", 1, "m", verify=True)["reason"] == "ok")
+    mv.decrypt_image = lambda p, a=None, x=None: b"\xff\xd8\xff" + b"j" * 80
+    stv = mv._image_status_for("u", 1, "m", verify=True)
+    check("解密后缺收尾标记 → original_partial",
+          stv["reason"] == "original_partial" and stv["available"] is False,
+          stv["reason"])
+    check("批量路径（verify=False）不解密、只看存在",
+          mv._image_status_for("u", 1, "m")["reason"] == "ok")
+
+    class Boom:
+        def __call__(self, *a, **k):
+            raise RuntimeError("没有图片密钥")
+    mv.decrypt_image = Boom()
+    check("拿不到密钥时不否决（判不了就说判不了，别退回误杀）",
+          mv._image_status_for("u", 1, "m", verify=True)["reason"] == "ok")
 
     import uiautomation as _auto
     _orig_root = _auto.GetRootControl

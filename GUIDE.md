@@ -514,20 +514,29 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
 
 | reason | 含义 | 能怎么办 |
 |---|---|---|
-| `ok` | `_h.dat` 在，且不比压缩版小 10% 以上 | `tier='original'` 直接拿 |
+| `ok` | `_h.dat` 在、不是空壳；`verify=True` 时还要求解密后结构完整 | `tier='original'` 直接拿 |
 | `mid_only` | 只有微信默认下发的压缩版 | 要原图就 `download_image_original()` 触发下载 |
 | `only_thumbnail` | 只有缩略图（群聊图从没点开过） | 同上 |
-| `original_partial` | 有 `_h.dat` 但是空壳／比压缩版还小 | 原图下载中断了，再触发一次 |
+| `original_partial` | 有 `_h.dat` 但是空壳（<1KB），或 `verify=True` 时解密后**缺 JPEG/PNG 收尾标记**（下到一半） | 再触发一次 |
 | `no_local_copy` / `no_md5` / `no_message_row` | 目录里一份都没有 / 取不到图片指纹 / 这条不是图片 | 核对 `local_id` 与账号目录 |
 
-「原图下好了没」的判据是**相对**的：非空、≥1KB、且不比压缩版小 10% 以上。
-以前那道门槛写死成「大于 100KB」，而本机实测 705 个 `_h.dat` 中位数只有 91.5KB、
-51.3% 在 100KB 以下——一半真原图被误判成「还没下载」。
+「原图下好了没」看的是**结构和空壳**，不是尺寸比例：非空、≥1KB；`image_status(..., verify=True)`
+会再解密看一眼有没有 `FF D9` / `IEND` 收尾（批量接口不要开，那等于把每张原图都解一遍）。
+**两代按尺寸猜的判据都被实测否掉了**：
 
-本机 211 个会话里 4271 条图片消息的实测分布：`mid_only` 2210、
-`only_thumbnail` 1428、`ok` 626、`original_partial` 5、`no_local_copy` 2。
-也就是说**多数图片本来就没有原图可下**（每 7 条里只有 1 条有），这是微信的存储
-策略，不是解密失败；先查状态再决定要不要触发下载，能省掉大量无效重试。
+- 1.2.4.2 之前是 `> 102400`：本机 705 个 `_h.dat` 中位数只有 91.5KB、51.3% 在 100KB 以下，
+  一半真原图被当成「还没下载」。
+- 1.2.4.2 换成「不比压缩版小 10% 以上」，**用户实机证明这条也是错的**：同一张图的 `.dat`
+  有时就是比 `_h.dat` 大（实测 h/mid 有 0.55、0.82 的，两种编码各存一份），于是真原图又被
+  判成没下完，代码去点「图片原始大小」——而那颗按钮在查看器里只是切显示缩放，
+  原图本来就在盘上时点了自然没有任何反应。
+
+正在下载中的截断由 `_wait_h_dat` 的「大小不再变化」轮询负责，不靠尺寸猜。
+
+本机 211 个会话 4825 条图片消息的实测分布（每会话取最近 400 条）：`mid_only` 2410、
+`only_thumbnail` 1773、`ok` 636、`original_partial` 3（三条都是 <1KB 的空壳）、
+`no_local_copy` 3。也就是说**多数图片本来就没有原图可下**（每 7 条里只有 1 条有），
+这是微信的存储策略，不是解密失败；先查状态再决定要不要触发下载，能省掉大量无效重试。
 
 ### 6.3 群聊图片 / Group chat images
 
@@ -553,6 +562,7 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
   - 点完之后是**轮询等** `_h.dat` 出现并停止变大（到 `timeout` 为止），不再固定睡 3 秒取一次
   - 点击坐标依赖 WeChat 4.x 的 `mmui::ChatBubbleReferItemView` 布局（DPI 感知进程下按物理像素定位），不同窗口宽度/DPI 用相对偏移自动适配 / click coords rely on the `mmui::*` layout (physical pixels under a DPI-aware process); relative offset adapts to window width/DPI
   - 预览窗口内的「图片原始大小」按钮是完整 UIA 控件，用 `Click()` 点击 / the preview-window button is a real UIA control and is clicked via `Click()`
+  - **「图片原始大小」点了没反应时改点「保存」兜底**：那颗按钮本质是查看器的缩放档，原图已在盘上（或这张根本没有更大的原件）时它不触发任何下载。所以 `_h.dat` 等不出来之后，会点预览窗的「保存」，用「点之前拍快照、点之后找新文件」把微信写出的**明文图片**收进 `save_dir`（快照只走「最近改过」的目录，不整树扫）；如果微信弹的是「另存为」，就用 `ValuePattern` 把目标路径填进去再 UIA 点保存——**全程不发键盘**。两条路都不通才返回 `None`
   - 预览窗里找不到「图片原始大小」按钮（这张本来就是原图／微信没给这个入口）会**明确警告并返回 `None`**，指引改用 `tier='best'`，不再和「下载没完成」混成同一种失败
 - 无 ffmpeg 时 wxgf 格式存为 `.wxgf` 原始数据兜底 / without ffmpeg, wxgf saved as `.wxgf`
 

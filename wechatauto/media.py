@@ -531,27 +531,48 @@ class MediaDownloader:
     @staticmethod
     def original_ready(h_size: Optional[int], mid_size: Optional[int] = None,
                        min_bytes: int = 1024) -> bool:
-        """``_h.dat`` 算不算「真的下好了」。
+        """``_h.dat`` 存不存在、是不是空壳。**不比大小**——尺寸不能当「下完没下完」的判据。
 
-        这里以前是硬编码 ``> 102400``：本机 705 个 ``_h.dat`` 中位数只有 91 KB，
-        **51.3% 已经下载成功的真原图被当成「还没下载」而返回 None**，调用方手里
-        就只剩缩略图——交易/聊天截图这种几十 KB 的小图最容易中招。换成相对判据：
-        非空、不小于 ``min_bytes``，且不比压缩版 ``.dat`` 小（原图不可能比压缩版小，
-        相等说明微信把同一份内容另存了一份，仍算原图）。
+        两代错判都在这儿：
+        - 1.2.4.2 之前是硬编码 ``> 102400``：本机 705 个 ``_h.dat`` 中位数只有 91.5KB，
+          51.3% 的真原图被当成「还没下载」。
+        - 1.2.4.2 换成「不比压缩版 ``.dat`` 小 10% 以上」，用户实机证明**这条也是错的**：
+          同一张图的 ``.dat`` 有时就是比 ``_h.dat`` 大（实测 h/mid 有 0.55、0.82 的，
+          两种编码各存一份），于是真原图又被判成没下完，代码去点「图片原始大小」——
+          而原图本来就在盘上，那个按钮只是切显示缩放，点了自然没有任何反应。
+
+        判「完整」改看**解密后的结构**（:meth:`_image_complete`：JPEG 有没有 ``FF D9``、
+        PNG 有没有 ``IEND``）；正在下载中的截断由 :meth:`_wait_h_dat` 的「大小不再变化」
+        轮询负责，不靠尺寸猜。``mid_size`` 参数保留不动签名（1.2.4.2 已发布），
+        但不再参与判断。
         """
-        if not h_size or h_size < int(min_bytes):
+        return bool(h_size) and int(h_size) >= int(min_bytes)
+
+    @staticmethod
+    def _image_complete(data) -> bool:
+        """解密出来的字节看起来是不是**一张完整的图**，而不是下到一半的截断文件。
+
+        认不出格式（wxgf 动画、别的容器）时返回 ``True``——不拿「看不懂」当「不完整」，
+        否则会重演误杀。
+        """
+        if not data or len(data) < 16:
             return False
-        if mid_size and h_size < int(mid_size * 0.9):
-            return False
+        head = data[:8]
+        if head[:3] == b"\xff\xd8\xff":          # JPEG
+            return b"\xff\xd9" in data[-64:]
+        if head[:4] == b"\x89PNG":               # PNG
+            return b"IEND" in data[-16:]
+        if head[:6] in (b"GIF87a", b"GIF89a"):   # GIF 结束符 0x3B，可能补零
+            return b"\x3b" in data[-16:]
         return True
 
-    def _wait_h_dat(self, user: str, md5: str, mid_sz: int = 0,
+    def _wait_h_dat(self, user: str, md5: str,
                     min_bytes: int = 1024, until: Optional[float] = None):
         """等 ``_h.dat`` 出现并下完：轮询到「可用 + 大小不再变化」，或到点。
 
         以前是点完固定 ``sleep(3)`` 再取一次——慢机上文件还在长就被判失败，
-        快机上白等。到 ``until`` 时若已满足 :meth:`original_ready` 也接受
-        （已经不比压缩版小，说明原件基本回来了）。
+        快机上白等。「下完没」这里只看**大小不再变化**，不看它和压缩版谁大
+        （见 :meth:`original_ready` 的说明：尺寸比例不是判据）。
         """
         last = None
         while True:
@@ -560,7 +581,7 @@ class MediaDownloader:
                 sz = os.path.getsize(p) if p else 0
             except OSError:
                 sz = 0
-            ready = self.original_ready(sz, mid_sz, min_bytes)
+            ready = self.original_ready(sz, min_bytes=min_bytes)
             if ready and last == sz:
                 return (p, sz)
             last = sz
@@ -812,8 +833,13 @@ class MediaDownloader:
             f.write(data)
         return out
 
-    def image_status(self, user: str, local_id: int) -> dict:
+    def image_status(self, user: str, local_id: int, verify: bool = False) -> dict:
         """一条图片消息在本机的副本情况——让「只要原图」的调用方不必靠猜。
+
+        Args:
+            verify: True 时会把 ``_h.dat`` **解密看一眼**再判完整（JPEG 有没有
+                ``FF D9``、PNG 有没有 ``IEND``）。批量调用不要开：那等于把每张原图
+                都解一遍。拿不到图片密钥时不否决，按尺寸结论返回。
 
         Returns:
             dict：``local_id`` / ``md5`` / ``tiers``（``{'original': 字节, 'mid':…,
@@ -821,7 +847,7 @@ class MediaDownloader:
             ``available`` / ``reason``。``reason`` 取值：``ok``、
             ``no_message_row``、``not_image``、``no_md5``、``no_local_copy``、
             ``only_thumbnail``、``mid_only``、``original_partial``（有 ``_h.dat``
-            但是空壳/比压缩版还小，通常表示原图下载中断）。
+            但结构不完整，即原图下载中断）。
         """
         row = self.db.get_message_row(user, local_id, local_type=3)
         if not row or row.get("local_type") != 3:
@@ -831,15 +857,20 @@ class MediaDownloader:
         if not md5:
             return {"local_id": local_id, "md5": None, "tiers": {},
                     "best": None, "available": False, "reason": "no_md5"}
-        return self._image_status_for(user, local_id, md5)
+        return self._image_status_for(user, local_id, md5, verify=verify)
 
-    def _image_status_for(self, user: str, local_id: int, md5: str) -> dict:
+    def _image_status_for(self, user: str, local_id: int, md5: str,
+                          verify: bool = False) -> dict:
         files = self._image_files(user, md5)
         tiers = {t: sz for t, (_p, sz) in files.items()}
         best = next((t for t in self.IMAGE_TIERS if t in tiers), None)
         reason = "no_local_copy"
         if "original" in tiers:
-            ok = self.original_ready(tiers["original"], tiers.get("mid"))
+            ok = self.original_ready(tiers["original"])
+            if ok and verify:
+                complete = self._decrypted_complete(user, md5)
+                if complete is False:
+                    ok = False
             reason = "ok" if ok else "original_partial"
             if not ok:
                 best = next((t for t in ("mid", "thumb") if t in tiers), None)
@@ -849,6 +880,19 @@ class MediaDownloader:
             reason = "only_thumbnail"
         return {"local_id": local_id, "md5": md5, "tiers": tiers,
                 "best": best, "available": reason == "ok", "reason": reason}
+
+    def _decrypted_complete(self, user: str, md5: str):
+        """解密看一眼 ``_h.dat`` 完不完整；``True``/``False``/``None``（判不了，不否决）。"""
+        path = (self._image_files(user, md5).get("original") or (None, 0))[0]
+        if not path:
+            return None
+        try:
+            data = self.decrypt_image(path)
+        except Exception:
+            return None
+        if not data:
+            return None
+        return self._image_complete(data)
 
     def list_image_status(self, user: str, limit: int = 300) -> List[dict]:
         """会话里所有图片消息的档位一览（按时间降序）。
@@ -1072,6 +1116,157 @@ class MediaDownloader:
             last = (o, notches)
             time.sleep(0.9)
         return None, "scroll-limit"
+
+    # ------------------------------------------------------------------
+    # 「保存」兜底：预览窗的保存按钮 → 微信自己写出的明文文件
+    # ------------------------------------------------------------------
+    _SAVE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+
+    def _recent_images(self, root, since):
+        """``root`` 下 mtime ≥ ``since`` 的图片文件 ``{路径: (mtime, 字节)}``。
+
+        只进「最近被改过」的目录：账号目录有上 GB 的附件树，全量走两遍太贵，
+        而微信写新文件时沿途目录的 mtime 一定会变。
+        """
+        out = {}
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                entries = list(os.scandir(d))
+            except OSError:
+                continue
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if e.stat(follow_symlinks=False).st_mtime >= since:
+                            stack.append(e.path)
+                    elif e.name.lower().endswith(self._SAVE_EXT):
+                        st = e.stat()
+                        if st.st_mtime >= since:
+                            out[e.path] = (st.st_mtime, st.st_size)
+                except OSError:
+                    continue
+        return out
+
+    @staticmethod
+    def _new_images(before, after):
+        """点「保存」之后新增/变大的图片文件路径。"""
+        return [p for p, (mt, sz) in after.items()
+                if p not in before or before[p][0] < mt - 1e-6]
+
+    @staticmethod
+    def _save_dialog():
+        """找「另存为」对话框（Win32 通用类 #32770），返回控件或 None。"""
+        import uiautomation as auto
+        try:
+            for w in auto.GetRootControl().GetChildren():
+                if (w.ClassName or "") == "#32770" and w.Name and \
+                        any(k in w.Name for k in ("另存", "保存为", "Save As")):
+                    return w
+        except Exception:
+            pass
+        return None
+
+    def _fill_save_dialog(self, dlg, target):
+        """在「另存为」里填路径并点保存：用 ValuePattern + UIA Invoke，**不发键盘**。
+
+        填不进去或找不到「保存」按钮就返回 False（调用方保留对话框，不硬点别的东西）。
+        """
+        import uiautomation as auto
+        edits, btns = [], []
+
+        def walk(c, d=0):
+            if d > 8:
+                return
+            for k in c.GetChildren():
+                ct = k.ControlTypeName or ""
+                if "Edit" in ct:
+                    edits.append(k)
+                elif "Button" in ct and (k.Name or "").strip() in ("保存(S)", "保存", "确定", "Save"):
+                    btns.append(k)
+                walk(k, d + 1)
+
+        walk(dlg)
+        if not edits or not btns:
+            return False
+        try:
+            edits[0].GetValuePattern().SetValue(target)
+        except Exception:
+            return False
+        try:
+            btns[0].GetInvokePattern().Invoke()
+            return True
+        except Exception:
+            return False
+
+    def _save_via_button(self, win, save_dir, stem, deadline, t0):
+        """点预览窗的「保存」，把微信写出的明文图片收进 ``save_dir``。
+
+        实测这台机上没有 ``temp/RWTemp`` 那种明文产物（那是 #30 报告人机器上的路径），
+        所以落点只能靠「点之前拍快照、点之后找新文件」来发现；如果微信弹的是
+        「另存为」，就直接把目标路径填进去，省掉再搬一次。
+
+        返回落盘路径，或 ``None``（没找到按钮 / 没出现新文件 / 超时）。
+        """
+        btn = self._find_preview_button(win, "保存")
+        if btn is None:
+            wxlog.debug("预览窗里没有「保存」按钮，保存兜底跳过")
+            return None
+        acc = getattr(self.db, "account_dir", None)
+        home = os.path.expanduser("~")
+        roots = [p for p in (acc, os.path.join(home, "Downloads"),
+                             os.path.join(home, "Pictures"),
+                             os.path.join(home, "Documents", "WeChat Files"))
+                 if p and os.path.isdir(p)]
+        since = max(t0 - 2.0, time.time() - 120.0)
+        before = {}
+        for r in roots:
+            before.update(self._recent_images(r, since))
+        try:
+            btn.Click()
+        except Exception:
+            try:
+                btn.GetInvokePattern().Invoke()
+            except Exception as e:
+                wxlog.debug("「保存」点不动：%s", type(e).__name__)
+                return None
+        target = self._out(save_dir, stem + ".jpg")
+        until = min(deadline, time.time() + 12.0)
+        dlg_handled = False
+        while time.time() < until:
+            dlg = self._save_dialog()
+            if dlg is not None and not dlg_handled:
+                dlg_handled = True
+                if self._fill_save_dialog(dlg, target):
+                    wxlog.debug("「另存为」已填目标路径并点保存")
+                    time.sleep(1.0)
+                    if os.path.isfile(target) and os.path.getsize(target) > 0:
+                        return target
+            new = self._new_images(before,
+                                   {p: v for r in roots for p, v in
+                                    self._recent_images(r, since).items()})
+            if new:
+                src = max(new, key=lambda p: (os.path.getmtime(p)
+                                              if os.path.exists(p) else 0))
+                if os.path.abspath(src) == os.path.abspath(target):
+                    return target
+                try:
+                    with open(src, "rb") as f:
+                        data = f.read()
+                    if data:
+                        with open(target, "wb") as f:
+                            f.write(data)
+                        wxlog.info("已用预览窗「保存」拿到明文图：%s（%d KB，源 %s）",
+                                   os.path.basename(target), len(data) // 1024,
+                                   os.path.basename(src))
+                        return target
+                except OSError as e:
+                    wxlog.debug("复制保存产物失败：%s", e)
+                return None
+            time.sleep(0.6)
+        wxlog.debug("点了「保存」但没发现新文件（12 秒内）")
+        return None
 
     def _voice_index(self, user: str):
         """该会话在各 media 分片里的 ``(chat_name_id, svr_id) -> 音频字节数``。
@@ -1349,13 +1544,23 @@ class MediaDownloader:
         files = self._image_files(user, md5)
         mid_sz = (files.get('mid') or (0, 0))[1]
         hit = files.get('original')
-        if hit and self.original_ready(hit[1], mid_sz, min_bytes):
+        if hit and self.original_ready(hit[1], min_bytes=min_bytes):
             # 短路：老代码一进门就驱动界面（点开大图、找预览窗），可原图常常早就在
             # 本地了——那样既慢，又要求微信在前台、目标气泡还必须在可视区里。
-            wxlog.debug("原图已在本地（%d KB），不触发界面：%s", hit[1] // 1024, hit[0])
-            return self._write_decrypted(
-                self.decrypt_image(hit[0], aes_key, xor_key),
-                "%s_%s" % (user, local_id), save_dir)
+            # 完整与否看**解密后的结构**，不看它和压缩版谁大（见 original_ready）。
+            try:
+                data = self.decrypt_image(hit[0], aes_key, xor_key)
+            except Exception as e:
+                data = None
+                wxlog.debug("短路解密 _h.dat 失败（%s），改走界面触发", type(e).__name__)
+            if data and self._image_complete(data):
+                wxlog.debug("原图已在本地（%d KB）且结构完整，不触发界面：%s",
+                            len(data) // 1024, hit[0])
+                return self._write_decrypted(
+                    data, "%s_%s" % (user, local_id), save_dir)
+            if data:
+                wxlog.warning("_h.dat 解密后缺 JPEG/PNG 收尾标记（下到一半），"
+                              "按「没下完」处理，改走界面触发：%d 字节", len(data))
 
         from .uia_driver import WeChatUIA
         from .guia import WinInput
@@ -1416,6 +1621,7 @@ class MediaDownloader:
         scroll_ok = bool(scroll and pid)
 
         clicked = False
+        saved_plain = None        # 「保存」兜底拿到的明文文件
         try:
             time.sleep(1.0)
             lst = _uia._message_list()
@@ -1539,10 +1745,20 @@ class MediaDownloader:
                     inp.real_click(int((btn_r.left + btn_r.right) / 2),
                                    int((btn_r.top + btn_r.bottom) / 2))
 
-                got = self._wait_h_dat(user, md5, mid_sz, min_bytes,
+                got = self._wait_h_dat(user, md5, min_bytes,
                                         min(deadline, time.time() + max(5.0, timeout / 3.0)))
                 if got:
                     wxlog.debug("原图已下好：%s（%d KB）", got[0], got[1] // 1024)
+                    clicked = True
+                    break
+                # 「图片原始大小」没让 _h.dat 出现。它本质是查看器的一颗按钮，
+                # 在有些图上只是切显示缩放、并不触发下载——退一步点预览窗的「保存」，
+                # 收微信自己写出的明文文件兜底。
+                saved = self._save_via_button(
+                    preview_win, save_dir, "%s_%s" % (user, local_id),
+                    deadline, time.time())
+                if saved:
+                    saved_plain = saved
                     clicked = True
                     break
                 wxlog.debug("点过之后 _h.dat 仍不可用（没出现/是半截文件），换下一个气泡")
@@ -1556,6 +1772,8 @@ class MediaDownloader:
                           "可能是气泡不在可视区、预览窗没弹、或微信侧没回数据",
                           st.get('tiers'), st.get('reason'))
             return None
+        if saved_plain:
+            return saved_plain
 
         # 解密 _h.dat（原图）。文件名保持老样子，不加档位后缀。
         h_dat = self._find_h_dat(user, md5)
