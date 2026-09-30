@@ -2172,6 +2172,8 @@ def t_image() -> None:
     class FakeUIA:
         chat = None
         no_hwnd = False
+        hide_list = 0            # >0：前 N 次 _message_list 返回 None（模拟停在朋友圈页）
+        recovered = 0
 
         def __init__(self, *a, **k):
             pass
@@ -2183,7 +2185,14 @@ def t_image() -> None:
             return FakeUIA.chat
 
         def _message_list(self):
+            if FakeUIA.hide_list > 0:
+                FakeUIA.hide_list -= 1
+                return None
             return FakeLst()
+
+        def back_to_chat_tab(self, settle=1.0):
+            FakeUIA.recovered += 1
+            return True
 
         def _force_foreground(self, hwnd):
             return True
@@ -2320,6 +2329,23 @@ def t_image() -> None:
     clicks.clear()
     check("屏上本来就开着预览窗时不算「点开成功」（只认新出现的窗口）",
           smoke(None, chat="显示名", pre_open=True)[0] is None)
+    # 主窗停在朋友圈页：RecyclerListView 真的不在树里，以前只警告一句就返回，
+    # 看起来就是「UIA 没有任何操作」。现在先点回「微信」标签再重新进会话。
+    FakeUIA.hide_list, FakeUIA.recovered = 1, 0
+    chatwith.clear()
+    clicks.clear()
+    out_r, _btn_r = smoke(None, chat="显示名")
+    check("消息列表不在树里 → 先点「微信」标签回聊天页（不是直接返回）",
+          FakeUIA.recovered == 1, str(FakeUIA.recovered))
+    check("恢复之后重新进会话并继续走完（真的去点了图）",
+          chatwith == ["显示名"] and out_r is not None, "%s %s" % (chatwith, out_r))
+    FakeUIA.hide_list, FakeUIA.recovered = 99, 0
+    clicks.clear()
+    out_n, _btn_n = smoke(None, chat="显示名")
+    check("点了还是拿不到消息列表 → 明确失败返回 None（不静默）",
+          out_n is None and FakeUIA.recovered == 1,
+          "%s %s" % (out_n, FakeUIA.recovered))
+    FakeUIA.hide_list = 0
 
     for p in tmpdirs:
         shutil.rmtree(p, ignore_errors=True)
