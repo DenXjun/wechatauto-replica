@@ -1619,6 +1619,64 @@ def t_image() -> None:
                              tier='thumb').endswith('_thumb.jpg')
           and md3.download_image('wxid_img', 7, tier='whatever') is None)
 
+    print("[image] tier='full'：只要非预览图那一份")
+    pf = MediaDownloader._pick_full
+    check("本机有 _h.dat → 取原件并标 _h",
+          pf({'original': ('a_h.dat', 200000), 'mid': ('a.dat', 100000)}, 100000)
+          == (('a_h.dat', 200000), '_h'))
+    check("本机只有完整图 .dat → 取它、文件名不带档位标记",
+          pf({'mid': ('a.dat', 100000), 'thumb': ('a_t.dat', 5000)}, 100000)
+          == (('a.dat', 100000), ''))
+    check("只有预览图 → None（绝不拿缩略图交差，这是和 tier='best' 唯一的区别）",
+          pf({'thumb': ('a_t.dat', 5000)}, 0) is None)
+    check("_h.dat 是空壳时退回完整图，不把空壳当成「非预览图」",
+          pf({'original': ('a_h.dat', 10), 'mid': ('a.dat', 100000)}, 100000)
+          == (('a.dat', 100000), ''))
+
+    def fake_tree(md, user='wxid_img'):
+        return _os.path.join(md.db.account_dir, 'msg', 'attach',
+                             hashlib.md5(user.encode()).hexdigest(), '2026-09')
+
+    mt = newmd({'thumb': 5000})
+    mt.decrypt_image = stub_decrypt(mt, used)
+    calls = []
+
+    def fake_ui(user, lid, save_dir=None, aes_key=None, xor_key=None, want="original"):
+        calls.append(want)
+        with open(_os.path.join(fake_tree(mt), MD5 + '.dat'), 'wb') as f:
+            f.write(b'\0' * 100000)
+        return _os.path.join(save_dir or mt.save_dir, '%s_%s.jpg' % (user, lid))
+    mt.download_image_original = fake_ui
+    out = mt.download_image('wxid_img', 7, save_dir=mt.save_dir, tier='full')
+    check("本机只有预览图 → tier=full 让微信去下（want='mid'），下完拿的是完整图",
+          calls == ['mid'] and out.endswith('wxid_img_7.jpg')
+          and used[-1].endswith(MD5 + '.dat'), "%s %s" % (calls, _os.path.basename(out or '')))
+    calls[:] = []
+    check("本机已有完整图 → tier=full 一次界面都不碰",
+          mt.download_image('wxid_img', 7, save_dir=mt.save_dir, tier='full')
+          .endswith('wxid_img_7.jpg') and calls == [], str(calls))
+    mt2 = newmd({'thumb': 5000})
+    mt2.download_image_original = lambda *a, **k: None
+    check("走完一轮界面还是没有完整图 → None（不拿预览图凑数）",
+          mt2.download_image('wxid_img', 7, tier='full') is None)
+    mt3 = newmd({})
+    seen = []
+    mt3.download_image_original = lambda *a, **k: (seen.append(k.get('want')), None)[1]
+    check("附件目录里这条图压根没出现过 → tier=full 也会去下（want='mid'）",
+          mt3.download_image('wxid_img', 7, save_dir=mt3.save_dir, tier='full') is None
+          and seen == ['mid'], str(seen))
+    check("同样什么都没有的时候，老的 tier=None 照旧直接返回 None（不碰界面）",
+          mt3.download_image('wxid_img', 7, save_dir=mt3.save_dir) is None and seen == ['mid'])
+
+    print("[image] image_status 里「有没有完整图」和「有没有原件」分开答")
+    check("mid_only 时 has_full=True（有完整图，只是没有勾了原图那一档）",
+          newmd({'mid': 100000, 'thumb': 5000}).image_status(
+              'wxid_img', 7)['has_full'] is True)
+    check("only_thumbnail 时 has_full=False（本机只有预览图）",
+          newmd({'thumb': 5000}).image_status('wxid_img', 7)['has_full'] is False)
+    check("ok 时 has_full 也为 True",
+          newmd({'original': 200000}).image_status('wxid_img', 7)['has_full'] is True)
+
     print("[image] 虚拟列表里先点最可能的那张")
     ob = MediaDownloader._order_bubbles
     pairs = [('a', 10), ('b', 20), ('c', 30), ('d', 40)]   # (气泡, top)：自上而下越来越新
@@ -2372,6 +2430,8 @@ def t_image() -> None:
                     {"type": "图片", "content": "", "local_id": 5}]
 
     plans = []
+    waited = []
+    decrypted = []
 
     class FakeBtn:
         def __init__(self, name="图片原始大小"):
@@ -2386,11 +2446,12 @@ def t_image() -> None:
 
     def smoke(sender, pid_ok=True, has_button=True, chat=None, pre_open=False,
               zoom="request", h_dat=True, save_returns=None,
-              tiers="none", own=None, index=None):
+              tiers="none", tiers_after=None, own=None, index=None, want="original"):
         """zoom: request=「图片原始大小」/ shown=「图片适应窗口大小」/ none=找不到那颗键
 
-        tiers: 本机附件目录里有哪些档（none=什么都没有 / mid=只有压缩版 /
-               thumb=只有缩略图 / h=有 _h.dat）
+        tiers: 本机附件目录里有哪些档（none=什么都没有 / mid=只有完整图 /
+               thumb=只有预览图 / h=有 _h.dat）
+        tiers_after: 点过界面**之后**才出现的档位（模拟「点开预览微信才把 .dat 下下来」）
         """
         FakeGui.pid = 4321 if pid_ok else None
         FakeUIA.no_hwnd = not pid_ok
@@ -2399,13 +2460,20 @@ def t_image() -> None:
         ms.save_dir = tempfile.mkdtemp(prefix='wxsmoke-')
         tmpdirs.append(ms.save_dir)
         ms.db = RowDB(sender, own, index)
-        # _h.dat 走「界面」这条路的前提是本机没有合格的原图档
-        ms._image_files = lambda u, m: dict({
+        _t0 = {
             "none": {},
             "mid": {"mid": ("C:\\tmp\\x.dat", 5000)},
-            "thumb": {"thumbnail": ("C:\\tmp\\x_t.dat", 900)},
+            "thumb": {"thumb": ("C:\\tmp\\x_t.dat", 900)},
             "h": {"original": ("C:\\tmp\\x_h.dat", 5000),
-                  "mid": ("C:\\tmp\\x.dat", 900)}}[tiers])
+                  "mid": ("C:\\tmp\\x.dat", 900)}}[tiers]
+        _t1 = {
+            "none": {},
+            "mid": {"mid": ("C:\\tmp\\x.dat", 5000)},
+            "thumb": {"thumb": ("C:\\tmp\\x_t.dat", 900)},
+            "h": {"original": ("C:\\tmp\\x_h.dat", 5000),
+                  "mid": ("C:\\tmp\\x.dat", 900)}}[tiers_after] if tiers_after else None
+        ms._image_files = lambda u, m: dict(
+            _t1 if (_t1 is not None and clicks) else _t0)
         ms._visible_rows = lambda lst: [("image", "图片", Ctl(700)),
                                         ("text", "正文一行", Ctl(950))]
         zoom_btn = FakeBtn({"request": "图片原始大小",
@@ -2433,15 +2501,15 @@ def t_image() -> None:
         # pre_open=True 模拟「本来就开着一张大图」——那种窗不能当成果。
         ms._preview_windows = lambda: ([(99, FakePreview())]
                                        if (pre_open or clicks) else [])
-        ms._wait_h_dat = lambda u, m, min_bytes=1024, until=None: (
-            ("C:\\tmp\\x_h.dat", 5000) if h_dat else None)
+        ms._wait_h_dat = lambda u, m, min_bytes=1024, until=None, tier="original": (
+            waited.append(tier) or (("C:\\tmp\\x_h.dat", 5000) if h_dat else None))
         ms._find_h_dat = lambda u, m: "C:\\tmp\\x_h.dat"
-        ms.decrypt_image = lambda p, a=None, x=None: JPEG
+        ms.decrypt_image = lambda p, a=None, x=None: (decrypted.append(p) or JPEG)
         ua, wxm, gu = _ud.WeChatUIA, _wxm.WeChat, _g.WinInput
         _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = FakeUIA, FakeWX, FakeInput
         try:
             out = ms.download_image_original("wxid_img", 7, timeout=3.0,
-                                             chat_name="显示名")
+                                             chat_name="显示名", want=want)
         finally:
             _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = ua, wxm, gu
             FakeUIA.no_hwnd = False
@@ -2451,10 +2519,14 @@ def t_image() -> None:
     clicks.clear()
     chatwith.clear()
     plans.clear()
+    decrypted.clear()
     out0, btn0 = smoke(None, chat="显示名")      # 已经在目标会话里
     check("函数体走完并解密落盘（没走到就报 NameError/AttributeError）",
           bool(out0) and out0.endswith("wxid_img_7.jpg") and _os.path.exists(out0),
           str(out0))
+    check("默认 want='original'：等的是 _h.dat、解密的也是 _h.dat",
+          waited == ["original"] and decrypted and decrypted[-1].endswith("x_h.dat"),
+          "%s %s" % (waited, decrypted[-1:]))
     check("走到了点击那一步（不是提前 return）", len(clicks) >= 1, str(clicks))
     check("别人发的：先点左边 x=777", clicks and clicks[0][0] == 777, str(clicks[:2]))
     check("缩放键处于「图片原始大小」状态时才点它（按名字点，不按比例猜）",
@@ -2510,6 +2582,33 @@ def t_image() -> None:
     out_h, _b3 = smoke(None, chat="显示名", tiers="h")
     check("本机已有合格 _h.dat → 不碰界面，直接解密落盘",
           out_h is not None and not clicks and not chatwith, "%s %s" % (out_h, clicks))
+
+    # want='mid'：调用方要的是「非预览图的完整图」，不是勾了原图那份。
+    # 那种情况下点缩放键是没道理的（点它才会去追原件），等的那一档也不是 _h.dat。
+    clicks.clear()
+    chatwith.clear()
+    waited.clear()
+    decrypted.clear()
+    out_m, btn_m = smoke(None, chat="显示名", tiers="thumb", tiers_after="mid",
+                         want="mid")
+    check("want='mid' 时不点缩放键（它只会把显示切去追原件）",
+          btn_m is not None and btn_m.clicked == 0, str(btn_m and btn_m.clicked))
+    check("want='mid' 时等的是 .dat 那一档（tier 传对了）",
+          waited == ["mid"], str(waited))
+    check("want='mid' 点完界面解密的是 .dat（不是 _h.dat）",
+          out_m is not None and _os.path.isfile(out_m)
+          and decrypted[-1].endswith("x.dat"), "%s %s" % (out_m, decrypted[-1:]))
+    clicks.clear()
+    waited.clear()
+    out_ms, _b = smoke(1, chat="显示名", tiers="thumb", tiers_after="mid", want="mid")
+    check("自己发的图 + want='mid' → 不适用「本机没有原件就直接 None」那条（完整图才是目标）",
+          bool(clicks) and out_ms is not None and waited == ["mid"],
+          "%s %s %s" % (bool(clicks), out_ms, waited))
+    clicks.clear()
+    chatwith.clear()
+    out_mm, _b2 = smoke(1, chat="显示名", tiers="mid", want="mid")
+    check("want='mid' 且本机已有完整图 → 直接解密落盘，一步界面都不碰",
+          out_mm is not None and not clicks and not chatwith, "%s %s" % (out_mm, clicks))
     plans.clear()
     smoke(None, pid_ok=False, chat="显示名")
     check("拿不到进程 id → 绝不滚界面（max_scrolls=0，落点无法校验）",

@@ -573,16 +573,23 @@ class MediaDownloader:
         return True
 
     def _wait_h_dat(self, user: str, md5: str,
-                    min_bytes: int = 1024, until: Optional[float] = None):
-        """等 ``_h.dat`` 出现并下完：轮询到「可用 + 大小不再变化」，或到点。
+                    min_bytes: int = 1024, until: Optional[float] = None,
+                    tier: str = "original"):
+        """等某档文件出现并下完：轮询到「可用 + 大小不再变化」，或到点。
 
         以前是点完固定 ``sleep(3)`` 再取一次——慢机上文件还在长就被判失败，
         快机上白等。「下完没」这里只看**大小不再变化**，不看它和压缩版谁大
         （见 :meth:`original_ready` 的说明：尺寸比例不是判据）。
+
+        ``tier`` 默认 ``'original'``（``_h.dat``）；传 ``'mid'`` 就是等微信把**非预览图**
+        那份 ``.dat`` 下下来——点开预览这一步本身就会触发它。
         """
         last = None
         while True:
-            p = self._find_h_dat(user, md5)
+            if tier == "original":
+                p = self._find_h_dat(user, md5)
+            else:
+                p = (self._image_files(user, md5).get(tier) or (None, 0))[0]
             try:
                 sz = os.path.getsize(p) if p else 0
             except OSError:
@@ -878,7 +885,11 @@ class MediaDownloader:
         Returns:
             dict：``local_id`` / ``md5`` / ``tiers``（``{'original': 字节, 'mid':…,
             'thumb':…}``，没有的档不出现）/ ``best``（本机最高一档）/
-            ``available`` / ``reason``。``reason`` 取值：``ok``、
+            ``available`` / ``has_full`` / ``reason``。``available`` 答的是
+            「有没有**原件**（``_h.dat``）」，``has_full`` 答的是「有没有**完整图**
+            （``_t.dat`` 之外的那两档任一）」——以前只有前者，拿着预览图的调用方和
+            缺少原件的调用方收到的是同一句「没有原图」。「原图」这个词两种意思都有人
+            用，所以两个都留着。``reason`` 取值：``ok``、
             ``no_message_row``、``not_image``、``no_md5``、``no_local_copy``、
             ``only_thumbnail``、``mid_only``、``original_partial``（有 ``_h.dat``
             但结构不完整，即原图下载中断）。
@@ -913,7 +924,10 @@ class MediaDownloader:
         elif "thumb" in tiers:
             reason = "only_thumbnail"
         return {"local_id": local_id, "md5": md5, "tiers": tiers,
-                "best": best, "available": reason == "ok", "reason": reason}
+                "best": best, "available": reason == "ok", "reason": reason,
+                # 「非预览图那份在不在本机」——和 available 不是一回事：available 说的
+                # 是有没有 _h.dat（勾了原图那一档），has_full 说的是有没有完整图。
+                "has_full": bool(("mid" in tiers) or ("original" in tiers))}
 
     def _decrypted_complete(self, user: str, md5: str):
         """解密看一眼 ``_h.dat`` 完不完整；``True``/``False``/``None``（判不了，不否决）。"""
@@ -1020,6 +1034,20 @@ class MediaDownloader:
                     return m.group(1).decode().lower()
         return None
 
+    @staticmethod
+    def _pick_full(files, mid_sz):
+        """本机「非预览图」那一份：``_h.dat`` > ``.dat``；只有缩略图时返回 ``None``。
+
+        这一档和 :meth:`image_status` 的 ``available`` 不是一回事——``available`` 问的是
+        「有没有勾了原图那种原件」，这里问的是「拿到的是不是一张完整图而不是预览图」。
+        """
+        hit = files.get('original')
+        if hit and MediaDownloader.original_ready(hit[1], mid_sz):
+            return hit, '_h'
+        if 'mid' in files:
+            return files['mid'], ''
+        return None
+
     def download_image(self, user: str, local_id: int, save_dir: Optional[str] = None,
                        aes_key: Optional[str] = None, xor_key: Optional[int] = None,
                        tier: Optional[str] = None) -> Optional[str]:
@@ -1033,7 +1061,14 @@ class MediaDownloader:
                 ``'original'`` 只要原图，本机没有就返回 ``None`` 不悄悄降级；
                 ``'mid'`` 只要压缩版；``'thumb'`` 只要缩略图；
                 ``'best'`` 原图 > 压缩版 > 缩略图，并把档位标在文件名上
-                （``_h`` / 无 / ``_thumb``）。
+                （``_h`` / 无 / ``_thumb``）；
+                ``'full'`` **只要「非预览图」**：原图 > 压缩版，绝不用缩略图交差；
+                本机两档都没有时会让微信去下（点开预览那一步本身就会下 ``.dat``，
+                见 :meth:`download_image_original` 的 ``want='mid'``），下完还是只有
+                预览图就返回 ``None``。想要「一张完整图」的调用方应该用这个而不是
+                ``'original'``——``'original'`` 要的是"发的时候勾了原图"那一档，
+                本机多数图根本没有（实测自发图 554 条里 19 条有、别人发的 3401 条里
+                611 条有）。
                 以前 ``tier=None`` 拿到压缩版时文件名不带任何标记，调用方分不清
                 自己拿到的是原图还是压缩版，只能靠大小猜——「只要原图」的调用方
                 因此要么误收、要么反复重试。
@@ -1045,7 +1080,7 @@ class MediaDownloader:
         if not md5:
             return None
         files = self._image_files(user, md5)
-        if not files:
+        if not files and tier != 'full':
             return None
         mid_sz = (files.get('mid') or (0, 0))[1]
         if tier is None:                       # 老行为：压缩版 → 缩略图
@@ -1070,6 +1105,24 @@ class MediaDownloader:
                 pick, suffix = files['thumb'], '_thumb'
             else:
                 return None
+        elif tier == 'full':
+            # 「非预览图」那一档：本机有 _h.dat 或 .dat 就解密落盘，一步界面都不碰；
+            # 两档都没有（只有缩略图，或者附件目录里根本没出现过）才让微信去下——
+            # 点开预览这一步本身就会把 .dat 拉下来，所以 want='mid' 不追原件、
+            # 也不点缩放键。下完再回到离线选择，文件名档位标记跟 'best' 保持一致。
+            got = self._pick_full(files, mid_sz)
+            if got is None:
+                self.download_image_original(user, local_id, save_dir=save_dir,
+                                             aes_key=aes_key, xor_key=xor_key,
+                                             want='mid')
+                files = self._image_files(user, md5)
+                mid_sz = (files.get('mid') or (0, 0))[1]
+                got = self._pick_full(files, mid_sz)
+                if got is None:
+                    wxlog.warning("图片 %s/%s 走完一轮界面还是没有非预览图那一份（本机档位：%s）",
+                                  user, local_id, ",".join(sorted(files)) or "无")
+                    return None
+            pick, suffix = got
         elif tier in ('mid', 'thumb'):
             hit = files.get(tier)
             if not hit:
@@ -1640,18 +1693,24 @@ class MediaDownloader:
                               aes_key: Optional[str] = None, xor_key: Optional[int] = None,
                               timeout: float = 30.0, chat_name: Optional[str] = None,
                               min_bytes: int = 1024, scroll: bool = True,
-                              max_scrolls: int = 6) -> Optional[str]:
+                              max_scrolls: int = 6,
+                              want: str = "original") -> Optional[str]:
         """下载原图：本机已有 ``_h.dat`` 就直接解密保存，否则驱动界面让微信去下载。
 
-        一条图片在本地最多三档：``_t.dat`` 缩略图（群里一般都有）、``.dat``
-        微信默认下发的压缩版、``_h.dat`` 真原图（点过「查看原图」才落盘）。
-        本方法要的是第三档。
+        一条图片在本地最多三档：``_t.dat`` 预览图（群里一般都有）、``.dat``
+        微信默认下发的**完整图**、``_h.dat`` 发的时候勾了「原图」才有的**原件**。
+        本方法默认要第三档；只要「非预览图」的调用方应该用
+        ``download_image(tier='full')``（本机有货时一步界面都不碰）。
 
         Args:
+            want: ``'original'``（默认）等的是 ``_h.dat``；``'mid'`` 等的是 ``.dat``
+                ——那种情况**不点缩放键**（点它才会去追原件），点开预览本身就会把
+                完整图带下来，尾部解密的也是 ``.dat``。
             timeout: 点击之后等 ``_h.dat`` 出现并下完的**总**上限（秒）。
                 以前这个参数是摆设（代码里只 ``sleep(3)`` 一次就判失败）。
-            min_bytes: ``_h.dat`` 的下限字节数；主判据是
-                :meth:`original_ready`（非空且不比压缩版小），这里只兜底。
+            min_bytes: 等到的那一档的下限字节数（挡空壳）；「下完没」看的是
+                :meth:`original_ready`（非空 + 不小于 ``min_bytes``）加上大小不再变化，
+                **不拿它和别的档比大小**（那条比例判据被实测否掉了）。
             chat_name: 用于 UI 搜索的会话名称（微信里显示的名字，默认用 user）
             scroll: 目标图片**不在可视区**时，是否按数据库算出的行差把消息列表滚过去
                 （默认 True）。设为 False 就只在当前屏上找，绝不滚动界面。
@@ -1681,7 +1740,7 @@ class MediaDownloader:
             return None
         files = self._image_files(user, md5)
         mid_sz = (files.get('mid') or (0, 0))[1]
-        hit = files.get('original')
+        hit = files.get(want)
         if hit and self.original_ready(hit[1], min_bytes=min_bytes):
             # 短路：老代码一进门就驱动界面（点开大图、找预览窗），可原图常常早就在
             # 本地了——那样既慢，又要求微信在前台、目标气泡还必须在可视区里。
@@ -1700,7 +1759,7 @@ class MediaDownloader:
                 wxlog.warning("_h.dat 解密后缺 JPEG/PNG 收尾标记（下到一半），"
                               "按「没下完」处理，改走界面触发：%d 字节", len(data))
 
-        if not hit and mid_sz and self._sent_by_self(row):
+        if want == "original" and not hit and mid_sz and self._sent_by_self(row):
             # 自己发出去的图，本机一般不存在「比 .dat 更大的一档」：实测 554 条自发
             # 图片消息里只有 19 条带 _h.dat，而那 19 条**都没有** .dat——只有发的时候
             # 勾了「原图」才留原件，留了原件就不再另存压缩版。剩下 527 条能拿到的最好
@@ -1901,7 +1960,11 @@ class MediaDownloader:
                 # 缩放键只在「当前是适应窗口、点一下要看原始大小」时才有意义；
                 # Name 已经是「图片适应窗口大小」说明原件就在显示中，再点只会缩回去。
                 zoom_name = (btn.Name or "").strip() if btn is not None else ""
-                if zoom_name == self.ZOOM_REQUEST:
+                if want != "original":
+                    # 只要「非预览图」那一份时不点缩放键：点它才会去追原件，而点开预览
+                    # 这一步本身就已经把完整图（.dat）带下来了。
+                    wxlog.debug("want=%s：不点缩放键，直接等本机出现那一档", want)
+                elif zoom_name == self.ZOOM_REQUEST:
                     try:
                         btn.Click()
                     except Exception:
@@ -1913,7 +1976,8 @@ class MediaDownloader:
                                 zoom_name or "没有这颗按钮", self.ZOOM_REQUEST)
 
                 got = self._wait_h_dat(user, md5, min_bytes,
-                                        min(deadline, time.time() + max(5.0, timeout / 3.0)))
+                                        min(deadline, time.time() + max(5.0, timeout / 3.0)),
+                                        tier=want)
                 if got:
                     wxlog.debug("原图已下好：%s（%d KB）", got[0], got[1] // 1024)
                     clicked = True
@@ -1935,18 +1999,24 @@ class MediaDownloader:
 
         if not clicked:
             st = self.image_status(user, local_id)
-            wxlog.warning("原图取不到：本机档位=%s reason=%s；"
+            wxlog.warning("%s取不到：本机档位=%s reason=%s；"
                           "可能是气泡不在可视区、预览窗没弹、或微信侧没回数据",
+                          "原图" if want == "original" else "完整图（非预览图）",
                           st.get('tiers'), st.get('reason'))
             return None
         if saved_plain:
             return saved_plain
 
-        # 解密 _h.dat（原图）。文件名保持老样子，不加档位后缀。
-        h_dat = self._find_h_dat(user, md5)
-        if not h_dat:
+        # 解密 want 那一档，文件名保持老样子，不加档位后缀。
+        # 'original' 仍走 _find_h_dat（和老版本同一个取法，调用方的桩也认它）；
+        # 'mid' 走 _image_files，因为那档根本没有 _h.dat 可找。
+        if want == "original":
+            path = self._find_h_dat(user, md5)
+        else:
+            path = (self._image_files(user, md5).get(want) or (None, 0))[0]
+        if not path:
             return None
-        return self._write_decrypted(self.decrypt_image(h_dat, aes_key, xor_key),
+        return self._write_decrypted(self.decrypt_image(path, aes_key, xor_key),
                                      "%s_%s" % (user, local_id), save_dir)
 
     def download_media(self, user: str, local_id: int, save_dir: Optional[str] = None) -> Optional[str]:
