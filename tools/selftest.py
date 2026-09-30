@@ -1463,15 +1463,259 @@ def t_tree() -> None:
           "_warn_gate_blocked" in seg2 and "self._wechat_hwnds(scan)" in seg2)
 
 
+# ----------------------------------------------------------------------
+# 14. 图片三档（_h.dat 原图 / .dat 压缩 / _t.dat 缩略图）——纯离线，临时目录 + 假 db
+# ----------------------------------------------------------------------
+def t_image() -> None:
+    """issue 反馈「只能下到缩略图，下不到原图」。
+
+    两处库侧原因：(1) download_image 压根不看 _h.dat，而且拿到压缩版时文件名
+    跟原图一模一样，「只要原图」的调用方只能靠大小猜；(2) download_image_original
+    里那道 `>102400` 硬门槛——本机 705 个 _h.dat 中位数只有 91KB，一半真原图被判
+    「还没下载」。这里把三档判据、分档取文件、气泡排序都钉住。"""
+    import hashlib
+    import os as _os
+    import shutil
+    import sqlite3
+    import tempfile
+    import time as _time
+
+    from wechatauto.media import MediaDownloader
+
+    MD5 = 'a' * 32
+    tmpdirs = []
+
+    def newmd(files_spec, user='wxid_img'):
+        """造一棵假的 attach 目录树：files_spec = {档位: 字节数}"""
+        d = tempfile.mkdtemp(prefix='wxim-')
+        tmpdirs.append(d)
+        base = _os.path.join(d, 'msg', 'attach',
+                             hashlib.md5(user.encode()).hexdigest(), '2026-09')
+        _os.makedirs(base)
+        suffix = {'original': '_h.dat', 'mid': '.dat', 'thumb': '_t.dat'}
+        for tier, size in files_spec.items():
+            with open(_os.path.join(base, MD5 + suffix[tier]), 'wb') as f:
+                f.write(b'\0' * size)
+        md = MediaDownloader.__new__(MediaDownloader)
+        md.save_dir = tempfile.mkdtemp(prefix='wxout-')
+        tmpdirs.append(md.save_dir)
+        md._image_key = md._xor_key = md._cfg_dword = None
+
+        class FakeDB:
+            account_dir = d
+
+            def get_message_row(self, u, lid, local_type=None):
+                return {"local_type": 3, "create_time": 1, "sort_seq": 9,
+                        "packed_info": MD5.encode(), "content": b''}
+        md.db = FakeDB()
+        md._tmp = d
+        return md
+
+    print("[image] 原图「下好了没」的判据")
+    orr = MediaDownloader.original_ready
+    check("非空且不比压缩版小 → 算原图", orr(90000, 95000) is True)
+    check("40KB 的小截图原图照样算（旧的 >100KB 硬门槛会误杀）",
+          orr(40000, 30000) is True and orr(40000, None) is True,
+          "%s %s" % (orr(40000, 30000), orr(40000, None)))
+    check("恰好卡在 90% 线上/线下", orr(90000, 100000) is True
+          and orr(89999, 100000) is False)
+    check("0 字节半截文件不算", orr(0, 45000) is False and orr(None, 45000) is False)
+    check("比压缩版小一半 → 不算（下载没完成）", orr(50000, 400000) is False)
+    check("没有压缩版可比时只看下限", orr(40000, None) is True
+          and orr(10, None) is False)
+
+    print("[image] 三档状态报告")
+    md = newmd({'original': 200000, 'mid': 100000, 'thumb': 5000})
+    st = md.image_status('wxid_img', 7)
+    check("三档齐全 → ok / best=original", st['available'] and st['best'] == 'original'
+          and st['reason'] == 'ok', str(st['reason']))
+    check("tiers 报出每档字节", st['tiers'] == {'original': 200000, 'mid': 100000,
+                                                'thumb': 5000}, str(st['tiers']))
+    check("md5 从 packed_info 里取到了", st['md5'] == MD5, str(st['md5'])[:8])
+    st2 = newmd({'mid': 100000, 'thumb': 5000}).image_status('wxid_img', 7)
+    check("只有压缩版 → mid_only（不是 ok，也不再冒充原图）",
+          st2['reason'] == 'mid_only' and st2['best'] == 'mid'
+          and st2['available'] is False, st2['reason'])
+    st3 = newmd({'thumb': 5000}).image_status('wxid_img', 7)
+    check("只有缩略图 → only_thumbnail", st3['reason'] == 'only_thumbnail', st3['reason'])
+    st4 = newmd({'original': 10, 'mid': 100000, 'thumb': 5000}).image_status('wxid_img', 7)
+    check("_h.dat 是半截文件 → original_partial，best 退回 mid",
+          st4['reason'] == 'original_partial' and st4['best'] == 'mid',
+          "%s %s" % (st4['reason'], st4['best']))
+    st5 = newmd({}).image_status('wxid_img', 7)
+    check("本机一份都没有 → no_local_copy", st5['reason'] == 'no_local_copy', st5['reason'])
+
+    class NoRow:
+        account_dir = '.'
+
+        def get_message_row(self, u, lid, local_type=None):
+            return None
+    mdr = MediaDownloader.__new__(MediaDownloader)
+    mdr.db = NoRow()
+    check("消息行不存在 → no_message_row，不抛",
+          mdr.image_status('x', 1)['reason'] == 'no_message_row')
+
+    class NoMd5(NoRow):
+        def get_message_row(self, u, lid, local_type=None):
+            return {"local_type": 3, "create_time": 1, "packed_info": b'', "content": '文本'}
+    mdn = MediaDownloader.__new__(MediaDownloader)
+    mdn.db = NoMd5()
+    check("内容里取不到图片指纹 → no_md5（不是 not_image）",
+          mdn.image_status('x', 1)['reason'] == 'no_md5')
+
+    print("[image] 分档取文件")
+    JPEG = b"\xff\xd8\xff" + b"J" * 64
+
+    def stub_decrypt(md, keep=None):
+        def _d(path, aes_key=None, xor_key=None):
+            if keep is not None:
+                keep.append(path)
+            return JPEG
+        return _d
+
+    md = newmd({'original': 200000, 'mid': 100000, 'thumb': 5000})
+    used = []
+    md.decrypt_image = stub_decrypt(md, used)
+    out = md.download_image('wxid_img', 7, save_dir=md.save_dir)
+    check("tier=None 仍是老行为（取压缩版、文件名不带档位标记）",
+          out.endswith('wxid_img_7.jpg') and '_h' not in _os.path.basename(out)
+          and used[-1].endswith(MD5 + '.dat'), _os.path.basename(out or ''))
+    out = md.download_image('wxid_img', 7, save_dir=md.save_dir, tier='original')
+    check("tier=original 取的是 _h.dat 且文件名带 _h",
+          used[-1].endswith(MD5 + '_h.dat') and out.endswith('wxid_img_7_h.jpg'),
+          _os.path.basename(out or ''))
+    out = md.download_image('wxid_img', 7, save_dir=md.save_dir, tier='best')
+    check("tier=best 优先原图", out.endswith('wxid_img_7_h.jpg'),
+          _os.path.basename(out or ''))
+    md2 = newmd({'original': 10, 'mid': 100000, 'thumb': 5000})
+    md2.decrypt_image = stub_decrypt(md2, used)
+    check("tier=original 但本机只有半截 _h → 返回 None，不悄悄降级",
+          md2.download_image('wxid_img', 7, save_dir=md2.save_dir, tier='original') is None)
+    out = md2.download_image('wxid_img', 7, save_dir=md2.save_dir, tier='best')
+    check("tier=best 遇到半截原图 → 退回压缩版", out.endswith('wxid_img_7.jpg'),
+          _os.path.basename(out or ''))
+    md3 = newmd({'thumb': 5000})
+    md3.decrypt_image = stub_decrypt(md3, used)
+    check("只有缩略图时 tier=None 照旧落 _thumb",
+          md3.download_image('wxid_img', 7, save_dir=md3.save_dir).endswith('wxid_img_7_thumb.jpg'))
+    check("tier=thumb 只拿缩略图 / 乱写的 tier 返回 None",
+          md3.download_image('wxid_img', 7, save_dir=md3.save_dir,
+                             tier='thumb').endswith('_thumb.jpg')
+          and md3.download_image('wxid_img', 7, tier='whatever') is None)
+
+    print("[image] 虚拟列表里先点最可能的那张")
+    ob = MediaDownloader._order_bubbles
+    pairs = [('a', 10), ('b', 20), ('c', 30), ('d', 40)]   # (气泡, top)：自上而下越来越新
+    check("n_newer=0 → 最下面那张排第一", ob(pairs, 0)[0] == 'd', str(ob(pairs, 0)))
+    check("n_newer=2 → 从下数第 3 张排第一", ob(pairs, 2)[0] == 'b', str(ob(pairs, 2)))
+    check("先试的那张之后仍按从上到下排队，一张不落",
+          ob(pairs, 2) == ['b', 'a', 'c', 'd'], str(ob(pairs, 2)))
+    check("目标在可视区之外时不盲猜（保持原顺序）",
+          ob(pairs, 9) == ['a', 'b', 'c', 'd'], str(ob(pairs, 9)))
+    check("乱序传入也按 top 排", ob(list(reversed(pairs)), 0)[0] == 'd')
+    check("空列表不抛", ob([], 0) == [])
+
+    class RowsDB:
+        def __init__(self, rows, boom=False):
+            self.rows, self.boom = rows, boom
+
+        def get_image_rows(self, user, limit=300):
+            if self.boom:
+                raise RuntimeError('库损坏')
+            return self.rows
+    mdc = MediaDownloader.__new__(MediaDownloader)
+    mdc.db = RowsDB([{'sort_seq': 10}, {'sort_seq': 12}, {'sort_seq': 5}])
+    check("数得出「比这条更新的图片」有几张", mdc._newer_image_count('u', 10) == 1)
+    mdc.db = RowsDB([], boom=True)
+    check("数不出来时返回 0 而不是抛", mdc._newer_image_count('u', 10) == 0)
+    check("sort_seq 缺失时返回 0",
+          MediaDownloader._newer_image_count(mdc, 'u', None) == 0)
+
+    print("[image] 等 _h.dat 下完")
+    tdir = tempfile.mkdtemp(prefix='wxwait-')
+    tmpdirs.append(tdir)
+    p0 = _os.path.join(tdir, 'zero.dat')
+    p1 = _os.path.join(tdir, 'full.dat')
+    open(p0, 'wb').write(b'\0' * 0)
+    open(p1, 'wb').write(b'\0' * 60000)
+    seq = [p0, p0, p1, p1]
+    mw = MediaDownloader.__new__(MediaDownloader)
+    mw._find_h_dat = lambda u, m: seq.pop(0) if seq else p1
+    got = mw._wait_h_dat('u', MD5, mid_sz=50000, until=_time.time() + 6)
+    check("先 0 后 60000 且稳定 → 判定下完", got is not None and got[1] == 60000, str(got))
+    mw2 = MediaDownloader.__new__(MediaDownloader)
+    mw2._find_h_dat = lambda u, m: p0
+    check("一直是 0 字节 → 到点返回 None（不返回半截文件）",
+          mw2._wait_h_dat('u', MD5, mid_sz=50000, until=_time.time() + 0.1) is None)
+
+    print("[image] db.get_image_rows 带出 packed_info")
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE Msg_1 (local_id INTEGER, server_id INTEGER, "
+                 "real_sender_id INTEGER, create_time INTEGER, sort_seq INTEGER, "
+                 "local_type INTEGER, packed_info_data BLOB, message_content BLOB)")
+    conn.execute("INSERT INTO Msg_1 VALUES (1, 11, 7, 100, 300, 3, ?, ?)",
+                 (MD5.encode(), b''))
+    conn.execute("INSERT INTO Msg_1 VALUES (2, 12, 7, 200, 400, 1, ?, ?)",
+                 (b'text', b'hello'))
+    conn.commit()
+    from wechatauto.db import WeChatDB
+    d = WeChatDB.__new__(WeChatDB)
+    d._run_msg_query = lambda user, fn: fn([(conn, 'Msg_1')])
+    rows = d.get_image_rows('wxid_img')
+    check("只返回图片行（local_type=3）", len(rows) == 1, str(len(rows)))
+    check("字段名对齐 get_message_row（packed_info / content）",
+          'packed_info' in rows[0] and 'content' in rows[0], str(sorted(rows[0])))
+    md4 = MediaDownloader.__new__(MediaDownloader)
+    md4.db = d
+    md4._image_files = lambda u, m: {}
+    check("list_image_status 用得上这条查询（不会误报 no_md5）",
+          md4._img_md5(rows[0]) == MD5, str(md4._img_md5(rows[0]))[:8])
+
+    print("[image] list_image_status 一次报全")
+    ml = newmd({'original': 200000, 'mid': 100000, 'thumb': 5000})
+    Other = hashlib.md5(b'other').hexdigest()
+
+    class ListDB:
+        account_dir = ml.db.account_dir
+
+        def get_image_rows(self, user, limit=300):
+            return [{"local_id": 7, "create_time": 100, "sort_seq": 300,
+                     "packed_info": MD5.encode(), "content": b''},
+                    {"local_id": 8, "create_time": 200, "sort_seq": 400,
+                     "packed_info": Other.encode(), "content": b''}]
+    ml.db = ListDB()
+    got = ml.list_image_status('wxid_img')
+    check("按行报档位，local_id/create_time 都带出来",
+          [g['local_id'] for g in got] == [7, 8] and got[0]['create_time'] == 100,
+          str([(g['local_id'], g['create_time']) for g in got]))
+    check("有 _h.dat 的那条 → ok/original，没下过的另一条 → no_local_copy",
+          got[0]['reason'] == 'ok' and got[0]['best'] == 'original'
+          and got[1]['reason'] == 'no_local_copy',
+          str([(g['reason'], g['best']) for g in got]))
+    scans = []
+    ml._image_files = lambda u, m: (scans.append(m) or {'mid': ('x', 100000)})
+    ml.db.get_image_rows = lambda user, limit=300: [
+        {"local_id": 7, "create_time": 100, "sort_seq": 300,
+         "packed_info": MD5.encode(), "content": b''},
+        {"local_id": 9, "create_time": 110, "sort_seq": 290,
+         "packed_info": MD5.encode(), "content": b''}]
+    check("同一 md5 只扫一次盘", len(ml.list_image_status('wxid_img')) == 2
+          and scans == [MD5], str(scans))
+
+    for p in tmpdirs:
+        shutil.rmtree(p, ignore_errors=True)
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
          "gate": t_gate, "click": t_click, "listen": t_listen, "moment": t_moment,
-         "sender": t_sender, "voice": t_voice, "tree": t_tree,
+         "sender": t_sender, "voice": t_voice, "tree": t_tree, "image": t_image,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
 
 
 def main() -> int:
     want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click", "listen",
-                            "moment", "sender", "voice", "tree",
+                            "moment", "sender", "voice", "tree", "image",
                             "keys", "sessions", "messages"]
     for name in want:
         fn = TESTS.get(name)

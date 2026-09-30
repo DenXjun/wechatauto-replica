@@ -439,7 +439,8 @@ md.detect_image_key()          # 扫描进程内存提取密钥（首次需要�
 # 按类型自动分发（3图片 34语音 43视频 49文件）/ auto-dispatch by type
 out = md.download_media("filehelper", 123, save_dir=r"D:\media")
 
-out = md.download_image("filehelper", 123)      # jpg/png/gif
+out = md.download_image("filehelper", 123)      # jpg/png/gif（旧行为）
+out = md.download_image("filehelper", 123, tier="best")    # 原图>压缩版>缩略图，档位标在文件名（§6.2.2）
 out = md.download_voice("filehelper", 123)      # .silk
 out = md.download_video("filehelper", 123)      # .mp4
 out = md.download_file("filehelper", 123)       # 原文件 / original file
@@ -480,14 +481,68 @@ md.voice_status("wxid_xxx", local_id)     # 单条，字段同上
 > 想补齐那 6%，只能在界面上把语音播放一遍（微信随后会把 `voice_data` 写进
 > `VoiceInfo`）。那属于驱动真实客户端的写动作，要走 `rhythm`，本库没有自动化它。
 
+### 6.2.2 图片有三档，先问清楚本机有没有原图 / Which image tier is on this machine
+
+一条图片消息在 `msg/attach/<md5(会话)>/<YYYY-MM>/` 下最多落三个文件：
+`<md5>_t.dat` 缩略图、`<md5>.dat` 微信默认下发的**压缩版**、`<md5>_h.dat`
+**真原图**（只有在微信里点过「查看原图 / 图片原始大小」才会落盘）。
+「只能下到缩略图、下不到原图」的反馈基本都出在这三档的歧义上——以前
+`download_image` 压根不看 `_h.dat`，而且拿到压缩版时文件名和原图一模一样，
+调用方只能靠大小猜，于是反复重试。
+
+```python
+out = md.download_image("群名", 123, tier="original")   # 只要原图，没有就 None，不降级
+out = md.download_image("群名", 123, tier="best")       # 原图 > 压缩版 > 缩略图
+out = md.download_image("群名", 123)                    # 不传 tier = 旧行为，逐字不变
+```
+
+| tier | 取哪一档 | 落盘文件名 | 本机没有时 |
+|---|---|---|---|
+| `None`（默认） | 压缩版 → 缩略图 | `<user>_<lid>.jpg` / `..._thumb.jpg` | 退缩略图 |
+| `'original'` | 只有 `_h.dat` | `..._h.jpg` | `None`（**不悄悄降级**） |
+| `'best'` | 原图 → 压缩版 → 缩略图 | 按档位标 `_h` / 无 / `_thumb` | `None` |
+| `'mid'` / `'thumb'` | 只要这一档 | 无 / `_thumb` | `None` |
+
+批量前先问一遍，别逐条试：
+
+```python
+for im in md.list_image_status("wxid_xxx", limit=300):
+    im['reason'], im['best'], im['tiers'], im['local_id']
+
+md.image_status("wxid_xxx", local_id)      # 单条，字段同上
+```
+
+| reason | 含义 | 能怎么办 |
+|---|---|---|
+| `ok` | `_h.dat` 在，且不比压缩版小 10% 以上 | `tier='original'` 直接拿 |
+| `mid_only` | 只有微信默认下发的压缩版 | 要原图就 `download_image_original()` 触发下载 |
+| `only_thumbnail` | 只有缩略图（群聊图从没点开过） | 同上 |
+| `original_partial` | 有 `_h.dat` 但是空壳／比压缩版还小 | 原图下载中断了，再触发一次 |
+| `no_local_copy` / `no_md5` / `no_message_row` | 目录里一份都没有 / 取不到图片指纹 / 这条不是图片 | 核对 `local_id` 与账号目录 |
+
+「原图下好了没」的判据是**相对**的：非空、≥1KB、且不比压缩版小 10% 以上。
+以前那道门槛写死成「大于 100KB」，而本机实测 705 个 `_h.dat` 中位数只有 91.5KB、
+51.3% 在 100KB 以下——一半真原图被误判成「还没下载」。
+
+本机 211 个会话里 4271 条图片消息的实测分布：`mid_only` 2210、
+`only_thumbnail` 1428、`ok` 626、`original_partial` 5、`no_local_copy` 2。
+也就是说**多数图片本来就没有原图可下**（每 7 条里只有 1 条有），这是微信的存储
+策略，不是解密失败；先查状态再决定要不要触发下载，能省掉大量无效重试。
+
 ### 6.3 群聊图片 / Group chat images
 
 - 群聊图片原图**只有点开查看过才落盘**；否则只有缩略图 / originals only stored after being opened
-- `download_image` 会自动回退缩略图，文件名带 `_thumb` 标记 / auto-falls back to thumbnail (`_thumb`)
+- `download_image` 会自动回退缩略图，文件名带 `_thumb` 标记 / auto-falls back to thumbnail (`_thumb`)；
+  不想回退就传 `tier='original'`，本机没有原图时返回 `None`（见 §6.2.2）
 - `download_image_original` 通过UI自动化点击图片消息触发微信下载原图 / `download_image_original` triggers download via UI click
+  - 本机已经有合格 `_h.dat` 时**直接解密落盘，不动界面** / a valid `_h.dat` already on disk is decrypted without touching the UI
   - 会切到对应会话；图片需已在消息区可见（无需滚动） / switches to the chat; images must be visible in the message area (no scrolling)
+  - 可视区里有多张图时，按「这条图片下面压了几张更新的图」把最可能的气泡排在第一个试，
+    每点一张都回来核对 `_h.dat` 是不是这条的；数不出来就逐个试，**不会盲滚**
+  - 点完之后是**轮询等** `_h.dat` 出现并停止变大（到 `timeout` 为止），不再固定睡 3 秒取一次
   - 点击坐标依赖 WeChat 4.x 的 `mmui::ChatBubbleReferItemView` 布局（DPI 感知进程下按物理像素定位），不同窗口宽度/DPI 用相对偏移自动适配 / click coords rely on the `mmui::*` layout (physical pixels under a DPI-aware process); relative offset adapts to window width/DPI
   - 缩略图 UIA 控件是空壳、拿不到真实位置，因此对消息列表图片用坐标点击；预览窗口内的「图片原始大小」按钮是完整 UIA 控件，用 `Click()` 点击 / image thumbnails expose no UIA children, so they are clicked by coordinate; the preview-window button is a real UIA control and is clicked via `Click()`
+  - 预览窗里找不到「图片原始大小」按钮（这张本来就是原图／微信没给这个入口）会**明确警告并返回 `None`**，指引改用 `tier='best'`，不再和「下载没完成」混成同一种失败
 - 无 ffmpeg 时 wxgf 格式存为 `.wxgf` 原始数据兜底 / without ffmpeg, wxgf saved as `.wxgf`
 
 ### 6.4 批量下载全部图片 / Batch download all images
@@ -631,6 +686,14 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 
 - 群聊图片原图未点开查看时只有缩略图，`download_image` 会自动回退
 - 若要全部，用 `_find_media_rows` + 遍历（6.4），或用 `--images` 参数
+- **1.2.4.2 起先问一句「本机到底有哪一档」**：`md.list_image_status(user)` /
+  `md.image_status(user, local_id)` 给每条图片 `tiers`（三档字节）/ `best` /
+  `reason`。`only_thumbnail`、`mid_only` 是微信的存储策略（原图从没点开过），
+  不是解密失败；`original_partial` 才是原图下载中断 / `list_image_status()`
+  tells you which tier actually exists before you retry anything
+- 只想要原图就写 `download_image(user, lid, tier='original')`：没有原图时返回
+  `None` 而不是悄悄给你压缩版；想要「能拿到的最好一档」用 `tier='best'`，
+  档位会标在文件名上（`_h` / 无 / `_thumb`）
 
 ### Q4: 发送失败 / sending fails
 
@@ -716,9 +779,13 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 | 方法 / Method | 说明 / Description |
 |---|---|
 | `detect_image_key(monitor)` | 提取图片密钥 / extract image key |
-| `download_image(user, lid)` | 图片（含缩略图/wxgf 回退）/ image |
-| `download_image_original(user, lid, timeout)` | 原图（UI点击触发下载）/ original image |
+| `download_image(user, lid, tier)` | 图片（三档：`_h.dat` 原图 / `.dat` 压缩 / `_t.dat` 缩略图；wxgf 转码）/ image, 3 tiers |
+| `download_image_original(user, lid, timeout, min_bytes)` | 触发微信下载原图并等它落盘（本机已有合格 `_h.dat` 时不动界面）/ trigger & wait for the original |
+| `image_status(user, lid)` | 单条图片本机有哪一档 + 原因 / which tier exists |
+| `list_image_status(user, limit)` | 整个会话的档位一览（§6.2.2）/ per-session tier report |
 | `download_voice(user, lid)` | 语音 .silk / voice |
+| `voice_status(user, lid)` | 单条语音取不到的原因 / why a voice has no audio |
+| `list_voice_status(user, limit)` | 整个会话的语音可用性一览（§6.2.1）/ per-session voice report |
 | `download_video(user, lid)` | 视频 .mp4 / video |
 | `download_file(user, lid)` | 原文件 / original file |
 | `download_media(user, lid)` | 按类型自动分发 / auto-dispatch by type |
