@@ -652,32 +652,17 @@ class MediaDownloader:
             return False
         return a == b or a[:10] in b or b[:10] in a
 
-    def _align_index(self, ui, db, target_local_id, min_score: float = 0.6,
-                     min_text_anchors: int = 2):
-        """把可视行序列与数据库行序列对齐，返回目标在 ``ui`` 里的下标（认不出给 None）。
+    def _align_window(self, ui, db, min_score: float = 0.6, min_text_anchors: int = 2):
+        """滑窗对齐可视行与数据库行，返回 ``{'offset','score','anchors','ties'}`` 或 None。
 
-        可视区只是整段历史中间的一小窗，所以整段滑动数据库窗口、取吻合度最高的偏移；
-        文本行还要求正文前缀一致（只比种类太松，容易贴错位）。吻合度不够、目标不在这
-        个窗口里、对齐结果说目标不是图片行——一律返回 ``None``：宁可不点，也不要点
-        到别人的图上。
-
-        ``min_text_anchors``：**至少要两条正文对得上的文本行**才认这份对齐。实机就
-        撞上过可视区只剩一行、吻合度 1.00 的假高分——那种情况下任何偏移都"完美吻合"，
-        等于没有信息；锚不住就退回 :meth:`_order_bubbles` 的计数法。
-
-        Args:
-            ui: :meth:`_visible_rows` 的结果。
-            db: ``[{'kind','content','local_id'}, ...]``，**自旧到新**。
+        ``offset`` 是 ``ui[0]`` 对应到 ``db`` 里的下标；``ties`` 是**并列最优**偏移列表。
+        可视区只有寥寥几行，「T I I T」这种形状在整段历史里会出现很多次，多个偏移同时
+        拿满分是常态而不是意外——所以要把它们都交出去，由调用方判断答案是否唯一。
         """
         n, m = len(ui), len(db)
         if not n or m < n:
             return None
-        try:
-            ti = next(i for i, d in enumerate(db)
-                      if d.get("local_id") == target_local_id)
-        except StopIteration:
-            return None
-        best = None
+        scored = []
         for o in range(0, m - n + 1):
             hit = anchors = 0
             for i in range(n):
@@ -690,15 +675,61 @@ class MediaDownloader:
                         continue
                     anchors += 1
                 hit += 1
-            score = hit / float(n)
-            if best is None or score > best[0]:
-                best = (score, o, anchors)
-        if best is None or best[0] < float(min_score) or best[2] < int(min_text_anchors):
+            scored.append((hit / float(n), anchors, o))
+        scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        best_score, best_anchors, best_off = scored[0]
+        if best_score < float(min_score) or best_anchors < int(min_text_anchors):
             return None
-        idx = ti - best[1]
-        if not (0 <= idx < n) or ui[idx][0] != "image":
+        ties = [o for sc, an, o in scored
+                if sc >= best_score - 1e-9 and an >= best_anchors]
+        return {"offset": best_off, "score": best_score,
+                "anchors": best_anchors, "ties": sorted(ties)}
+
+    def _align_index(self, ui, db, target_local_id, min_score: float = 0.6,
+                     min_text_anchors: int = 2):
+        """目标消息在**可视行**里的下标；认不出、或认得不唯一，一律 ``None``。
+
+        实机撞过可视区只剩一行时「吻合度 1.00」的假高分（那种情况任何偏移都算完美吻
+        合），所以要求至少 ``min_text_anchors`` 条正文对得上的文本行 + 吻合度
+        ≥ ``min_score``；再要求**所有并列最优偏移都指向同一行**——否则宁可退回
+        :meth:`_order_bubbles` 的计数法，也不要点到别人的图上。
+
+        Args:
+            ui: :meth:`_visible_rows` 的结果。
+            db: ``[{'kind','content','local_id'}, ...]``，**自旧到新**。
+        """
+        w = self._align_window(ui, db, min_score, min_text_anchors)
+        if not w:
             return None
+        try:
+            ti = next(i for i, d in enumerate(db)
+                      if d.get("local_id") == target_local_id)
+        except StopIteration:
+            return None
+        idx = None
+        for o in w["ties"]:
+            j = ti - o
+            if not (0 <= j < len(ui)) or ui[j][0] != "image":
+                return None          # 有并列偏移认为目标压根不在屏上 → 认不得
+            if idx is None:
+                idx = j
+            elif idx != j:
+                return None          # 并列偏移给出不同答案 → 歧义，不动手
         return idx
+
+    @staticmethod
+    def _plan_scroll(delta_rows: int, rows_per_notch: float = 1.0, max_notches: int = 12):
+        """把「还差几行」换算成滚轮：返回 ``(delta, 格数)``，不需要滚时 ``(0, 0)``。
+
+        聊天列表**最新在下方**，所以要把窗口往更新推（``delta_rows > 0``）得向下滚 =
+        **负** delta；往更早推是正。这个方向和朋友圈时间线相反（那边最新在上方），
+        别照抄。
+        """
+        if not delta_rows:
+            return (0, 0)
+        per = max(0.2, float(rows_per_notch))
+        notches = min(int(max_notches), max(1, int(abs(int(delta_rows)) / per + 0.999)))
+        return (-120 if delta_rows > 0 else 120, notches)
 
     @staticmethod
     def _bubble_click_xs(rect, is_self) -> list:
@@ -944,6 +975,77 @@ class MediaDownloader:
         data = self.decrypt_image(pick[0], aes_key, xor_key)
         return self._write_decrypted(data, "%s_%s%s" % (user, local_id, suffix), save_dir)
 
+    @staticmethod
+    def _scroll_list(lst, delta: int, times: int, uia, hwnd, pid) -> bool:
+        """在消息列表中央滚 ``times`` 格；落点不属于微信或置不上前台就**不滚**。
+
+        滚轮是按光标出队那一刻的位置投递的，而且微信不是前台窗口时 mmui 根本不接收
+        ——所以先置前台，再交给 :func:`moment._send_scroll`（它带落点归属校验：曾经
+        有一次自检把滚轮打进了压在微信上面的 IDE）。
+        """
+        from .moment import _send_scroll
+        r = lst.BoundingRectangle
+        x = int((r.left + r.right) / 2)
+        y = int((r.top + r.bottom) / 2)
+        if hwnd:
+            try:
+                uia._force_foreground(hwnd)
+            except Exception as e:
+                wxlog.debug("置前台失败：%s", type(e).__name__)
+        return bool(_send_scroll(x, y, delta=delta, times=int(times), expect_pid=pid))
+
+    def _locate_image_row(self, local_id, lst, db_seq, uia, hwnd, pid,
+                          deadline, max_scrolls: int = 6):
+        """认出目标图片行；不在可视区时**按数据库算出的行差滚过去**再认。
+
+        返回 ``(控件, 说明)``。认不出时控件为 ``None``，说明写清卡在哪一步，调用方据此
+        决定是退回计数法还是直接放弃：``align`` 锚点不够或对不齐 · ``not-in-db`` 目标不
+        在取回的历史窗口里（要加 ``get_messages`` 的 limit）· ``scroll-blocked`` 滚轮没
+        发出去（非前台 / 落点不是微信）· ``scroll-stuck`` 滚了但窗口纹丝不动 ·
+        ``scroll-limit`` 滚到次数上限还没滚到。
+
+        每格滚多少行是**实测出来的**：先按 1 行/格 假设，滚完看偏移真的挪了几行再修正，
+        所以不同 DPI、不同窗口高度都不需要预设常量。
+        """
+        rows_per_notch = 1.0
+        last = None                       # 上一轮的 (偏移, 格数)，用来量实际推进
+        for attempt in range(int(max_scrolls) + 1):
+            if time.time() >= deadline:
+                return None, "align"
+            ui = self._visible_rows(lst)
+            w = self._align_window(ui, db_seq)
+            if not w:
+                return None, "align"
+            try:
+                ti = next(i for i, d in enumerate(db_seq)
+                          if d.get("local_id") == local_id)
+            except StopIteration:
+                return None, "not-in-db"
+            idx = self._align_index(ui, db_seq, local_id)
+            if idx is not None:
+                return ui[idx][2], ("aligned" if attempt == 0 else "aligned-after-%d" % attempt)
+            if last is not None:
+                if w["offset"] == last[0]:
+                    return None, "scroll-stuck"
+                rows_per_notch = max(0.2, abs(w["offset"] - last[0]) / float(max(1, last[1])))
+                last = None
+                wxlog.debug("实测每格滚 %.1f 行", rows_per_notch)
+            if attempt >= int(max_scrolls):
+                return None, "scroll-limit"
+            o, n = w["offset"], len(ui)
+            delta_rows = (ti - (o + n - 1)) if ti >= o + n else (ti - o)
+            sign, notches = self._plan_scroll(delta_rows, rows_per_notch)
+            if not notches:
+                return None, "align"
+            wxlog.debug("目标在可视窗口%s %d 行处，滚 %d 格（每格≈%.1f 行）",
+                        "之后（更新）" if delta_rows > 0 else "之前（更早）",
+                        abs(delta_rows), notches, rows_per_notch)
+            if not self._scroll_list(lst, sign, notches, uia, hwnd, pid):
+                return None, "scroll-blocked"
+            last = (o, notches)
+            time.sleep(0.9)
+        return None, "scroll-limit"
+
     def _voice_index(self, user: str):
         """该会话在各 media 分片里的 ``(chat_name_id, svr_id) -> 音频字节数``。
 
@@ -1184,7 +1286,8 @@ class MediaDownloader:
     def download_image_original(self, user: str, local_id: int, save_dir: Optional[str] = None,
                               aes_key: Optional[str] = None, xor_key: Optional[int] = None,
                               timeout: float = 30.0, chat_name: Optional[str] = None,
-                              min_bytes: int = 1024) -> Optional[str]:
+                              min_bytes: int = 1024, scroll: bool = True,
+                              max_scrolls: int = 6) -> Optional[str]:
         """下载原图：本机已有 ``_h.dat`` 就直接解密保存，否则驱动界面让微信去下载。
 
         一条图片在本地最多三档：``_t.dat`` 缩略图（群里一般都有）、``.dat``
@@ -1197,6 +1300,10 @@ class MediaDownloader:
             min_bytes: ``_h.dat`` 的下限字节数；主判据是
                 :meth:`original_ready`（非空且不比压缩版小），这里只兜底。
             chat_name: 用于 UI 搜索的会话名称（微信里显示的名字，默认用 user）
+            scroll: 目标图片**不在可视区**时，是否按数据库算出的行差把消息列表滚过去
+                （默认 True）。设为 False 就只在当前屏上找，绝不滚动界面。
+            max_scrolls: 最多滚几轮（每轮滚完重新认一次行）。滚不动或滚满会明确报
+                ``scroll-stuck`` / ``scroll-limit``，不会一直滚。
 
         Returns:
             解密后的原图路径（文件名沿用 ``<user>_<local_id>.<ext>``，不加档位后缀，
@@ -1234,6 +1341,7 @@ class MediaDownloader:
         time.sleep(1.0)
 
         opened = False
+        wx = None
         for _retry in range(3):
             try:
                 from .wx import WeChat
@@ -1245,6 +1353,12 @@ class MediaDownloader:
                 wxlog.debug("ChatWith 第 %d 次抛错：%s: %s",
                             _retry, type(e).__name__, str(e)[:100])
                 time.sleep(1.0)
+        hwnd = pid = None
+        try:                              # 滚动定位要用的两样：主窗句柄 + 微信进程 id
+            hwnd = wx._gui.main_hwnd or None
+            pid = wx._gui.pid or None
+        except Exception:
+            pass
 
         clicked = False
         try:
@@ -1262,43 +1376,52 @@ class MediaDownloader:
             wxlog.debug("消息列表 rect=(%d,%d,%d,%d) ChatWith=%s",
                         lst_rect.left, lst_rect.top, lst_rect.right,
                         lst_rect.bottom, opened)
-            ui = self._visible_rows(lst)
-            images = [c for k, _n, _c in ui if k == "image"]
-            wxlog.debug("可视消息行 %d 行（其中图片行 %d 行）ChatWith=%s",
-                        len(ui), len(images), opened)
-            if not images:
-                # RecyclerListView 是虚拟化的，只实例化可视区那十来行；目标
-                # 那条图没在视野里就扫不到，这里只报不猜（滚动定位另说）。
-                wxlog.warning("可视区里没有图片气泡：消息表有这条图，但它没渲染出来"
-                              "（会话已打开的话，把窗口滚到那条消息再试）")
-                return None
-
-            # 「哪一行才是这条图」：文本行的 Name 就是真实正文、时间行也在序列里，
-            # 所以整段可视行序列可以和数据库对齐，对齐成功后直接点名目标行——
-            # 比「数它下面压了几张更新的图」准得多（两张图挨着时数错就点到别人的图）。
-            target_ch = None
+            # 「哪一行才是这条图」：文本行的 Name 就是真实正文，所以整段可视行序列可以和
+            # 数据库对齐 → 直接点名目标行；目标不在可视区时按数据库算出的行差**滚过去**
+            # 再认。对不齐（或并列偏移给不出唯一答案）才退回「数它下面压了几张更新的图」。
+            deadline = time.time() + max(3.0, float(timeout))
+            db_seq = []
             try:
-                recent = self.db.get_messages(user, limit=120)      # 降序
+                recent = self.db.get_messages(user, limit=400)       # 降序
                 db_seq = [{"kind": self._DB_ROW_KIND.get(r.get("type") or ""),
                            "content": r.get("content") or "",
                            "local_id": r.get("local_id")}
-                          for r in reversed(recent)]                # 自旧到新
+                          for r in reversed(recent)]                 # 自旧到新
                 db_seq = [d for d in db_seq if d["kind"]]
-                idx = self._align_index(ui, db_seq, local_id)
-                if idx is not None:
-                    target_ch = ui[idx][2]
-                    wxlog.debug("按 UIA 行序列认出目标：可视第 %d/%d 行（比对窗口 %d 行）",
-                                idx + 1, len(ui), len(db_seq))
             except Exception as e:
-                wxlog.debug("行序列对齐没做成（%s），退回按图片计数", type(e).__name__)
-            if target_ch is None:
+                wxlog.debug("取历史消息失败（%s），只能按图片计数尝试", type(e).__name__)
+            target_ch = None
+            note = "no-db"
+            if db_seq:
+                try:
+                    target_ch, note = self._locate_image_row(
+                        local_id, lst, db_seq, _uia, hwnd, pid,
+                        min(deadline, time.time() + max(3.0, float(timeout) * 0.5)),
+                        max_scrolls=max(0, int(max_scrolls)) if scroll else 0)
+                except Exception as e:
+                    wxlog.debug("定位图片行抛错（%s），退回按图片计数", type(e).__name__)
+                    note = "error"
+            ui = self._visible_rows(lst)     # 滚过一轮之后可视区已经变了，重读
+            images = [c for k, _n, _c in ui if k == "image"]
+            wxlog.debug("可视消息行 %d 行（图片行 %d 行）定位结果=%s ChatWith=%s",
+                        len(ui), len(images), note, opened)
+            if not images:
+                # RecyclerListView 是虚拟化的，只实例化可视区那十来行；滚过一轮还是扫不到
+                # 就只报不猜。
+                wxlog.warning("可视区里没有图片气泡（定位结果：%s）：消息表有这条图，"
+                              "但它没渲染出来——把窗口滚到那条消息附近再试" % note)
+                return None
+            if target_ch is not None and any(target_ch is c for _k, _n, c in ui):
+                order = [target_ch] + [c for c in images if c is not target_ch]
+                wxlog.debug("按数据库行序列认出目标：可视第 %d/%d 行（比对窗口 %d 行）",
+                            [c for _k, _n, c in ui].index(target_ch) + 1,
+                            len(ui), len(db_seq))
+            else:
                 n_newer = self._newer_image_count(user, row.get("sort_seq"))
                 order = self._order_bubbles(
                     [(ch, ch.BoundingRectangle.top) for ch in images], n_newer)
-                wxlog.debug("没认出具体哪一行：目标下面有 %d 张更新的图，可视气泡 %d 个，"
-                            "按此排定尝试顺序", n_newer, len(order))
-            else:
-                order = [target_ch] + [ch for ch in images if ch is not target_ch]
+                wxlog.debug("没认出具体哪一行（%s）：目标下面有 %d 张更新的图，可视气泡 %d 个，"
+                            "按此排定尝试顺序", note, n_newer, len(order))
             is_self = (row.get("sender_id") == 2)
             # 屏幕上已经开着预览窗时，「有没有新窗口」这个判据会失真（实测撞上过一次
             # 假成功），所以记下已有句柄，只把**新出现**的窗口算作点开。
@@ -1306,7 +1429,6 @@ class MediaDownloader:
             if before:
                 wxlog.warning("屏幕上已有 %d 个预览窗：本轮只把新出现的窗口算作点开成功"
                               "（先手动关掉再跑，判据更干净）", len(before))
-            deadline = time.time() + max(3.0, float(timeout))
 
             for img_ch in order:
                 if time.time() >= deadline:

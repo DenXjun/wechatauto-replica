@@ -1798,10 +1798,16 @@ def t_image() -> None:
           lv._align_index(ui3, db3, 105, min_score=0.5) == 5)
     # 实机撞到的假高分：可视区只剩一行时，任何偏移都「完美吻合」
     one_row = [("image", "图片", "A")]
-    check("可视区只剩一行时不给结果（吻合度 1.00 是假的，没有文本锚点）",
+    check("可视区只剩一行时不给结果（吻合度 1.00 是假的，既没锚点也不唯一）",
           lv._align_index(one_row, db, 101) is None)
-    check("显式不要锚点时才给结果（钉住 min_text_anchors 确实在挡）",
-          lv._align_index(one_row, db, 101, min_text_anchors=0) == 0)
+    # 单独钉 min_text_anchors：窗口形状在库里只出现一次（没有并列偏移），
+    # 但整屏一张文本行都没有 —— 这时挡下它的只能是锚点规则。
+    img_only_db = dbspec([("text", "甲"), ("image", ""), ("image", ""), ("text", "乙")])
+    img_only_ui = [("image", "图片", "A"), ("image", "图片", "B")]
+    check("唯一偏移但一条文本锚点都没有 → None",
+          lv._align_index(img_only_ui, img_only_db, 102) is None)
+    check("显式不要锚点时才放行（钉住挡下它的是锚点规则，不是并列歧义）",
+          lv._align_index(img_only_ui, img_only_db, 102, min_text_anchors=0) == 1)
     one_anchor = [("image", "图片", "A"), ("text", "收到", "E")]
     check("只有一条文本锚点也不给结果", lv._align_index(one_anchor, db, 103) is None)
     check("两条锚点才放行（ui2 里「本周试卷…」+「收到」正好两条）",
@@ -1818,6 +1824,107 @@ def t_image() -> None:
           and xs(wide, True)[0] > xs(wide, False)[0], str(xs(wide, True)))
     check("两侧都给出（第一侧没点开还能试另一侧）", len(xs(wide, True)) == 2
           and set(xs(wide, True)) == set(xs(wide, False)))
+
+    print("[image] 并列偏移必须认得出「不唯一」")
+    def mkdb(spec, first_id=1000):
+        return [{"kind": k, "content": c, "local_id": first_id + i}
+                for i, (k, c) in enumerate(spec)]
+    # 正文每两行重复一次 → 偏移 0 和 2 都满分，锚点也都够
+    dup = mkdb([("text", "甲"), ("image", ""), ("text", "甲"), ("image", ""),
+                ("text", "甲"), ("image", "")])
+    dup_ui = [("text", "甲", "A"), ("image", "图片", "B"),
+              ("text", "甲", "C"), ("image", "图片", "D")]
+    w = lv._align_window(dup_ui, dup)
+    check("并列最优偏移会被报出来", w and len(w["ties"]) > 1, str(w and w["ties"]))
+    check("并列偏移对「目标是第几行」给不出唯一答案 → None（宁可不点）",
+          lv._align_index(dup_ui, dup, 1001) is None)
+    uniq = mkdb([("text", "甲"), ("image", ""), ("text", "乙"), ("image", ""),
+                 ("text", "丙"), ("image", "")])
+    uniq_ui = [("text", "乙", "A"), ("image", "图片", "B"),
+               ("text", "丙", "C"), ("image", "图片", "D")]
+    w2 = lv._align_window(uniq_ui, uniq)
+    check("正文各不相同 → 只有一个最优偏移", w2 and w2["ties"] == [2], str(w2 and w2["ties"]))
+    check("唯一偏移时正常点名目标（local_id=1003 → 可视第 2 行）",
+          lv._align_index(uniq_ui, uniq, 1003) == 1)
+
+    ps = MediaDownloader._plan_scroll
+    check("往更新的方向推 = 向下滚（负 delta），聊天列表最新在下方",
+          ps(3, 1.0) == (-120, 3), str(ps(3, 1.0)))
+    check("往更早推 = 正 delta", ps(-3, 1.0) == (120, 3), str(ps(-3, 1.0)))
+    check("每格滚 2 行时格数减半（向上取整）", ps(5, 2.0) == (-120, 3), str(ps(5, 2.0)))
+    check("行差 0 不滚", ps(0) == (0, 0))
+    check("单轮格数封顶", ps(500, 1.0) == (-120, 12), str(ps(500, 1.0)))
+
+    print("[image] 目标不在屏上时按数据库行差滚过去")
+    ROWS = 4
+
+    class World:
+        """假界面：可视窗口是 db 序列里的一段，滚动 = 把这段往前/后推。"""
+
+        def __init__(self, db, off=0, rows_per_notch=2.0, moves=True, sends=True):
+            self.db, self.off, self.n = db, off, ROWS
+            self.rpn, self.moves, self.sends = rows_per_notch, moves, sends
+            self.calls = []
+
+        def visible(self, _lst):
+            return [("text" if d["kind"] == "text" else "image",
+                     d["content"] if d["kind"] == "text" else "图片",
+                     "row%d" % (self.off + i))
+                    for i, d in enumerate(self.db[self.off:self.off + self.n])]
+
+        def scroll(self, lst, delta, times, uia, hwnd, pid):
+            self.calls.append((delta, times))
+            if not self.sends:
+                return False          # 滚轮根本没发出去（非前台 / 落点不是微信）
+            if self.moves:
+                step = int(round(times * self.rpn)) or 1
+                self.off = max(0, min(len(self.db) - self.n,
+                                      self.off + (step if delta < 0 else -step)))
+            return True
+    world_db = mkdb([("text", "甲"), ("image", ""), ("text", "乙"), ("image", ""),
+                     ("text", "丙"), ("image", ""), ("text", "丁"), ("image", ""),
+                     ("text", "戊"), ("image", "")])
+    import time as _t
+
+    def locate(off0, target, **kw):
+        wr = World(world_db, off=off0, **kw)
+        m2 = MediaDownloader.__new__(MediaDownloader)
+        m2._visible_rows = wr.visible
+        m2._scroll_list = staticmethod(wr.scroll)
+        ctl, note = m2._locate_image_row(target, None, world_db, None, 1, 2,
+                                         _t.time() + 30, max_scrolls=4)
+        return wr, ctl, note
+    wr, ctl, note = locate(0, 1005)                    # 目标在 i=5，窗口是 0..3
+    check("目标不在屏上 → 先滚再认，滚完点到名",
+          note == "aligned-after-1" and ctl == "row5", "%s %s" % (note, ctl))
+    check("滚的方向对（要更新的 → 负 delta）",
+          wr.calls and wr.calls[0][0] == -120, str(wr.calls))
+    wr2, ctl2, note2 = locate(6, 1001)                 # 目标在更早的位置
+    check("目标在更早期 → 往回滚（正 delta）",
+          note2.startswith("aligned") and wr2.calls[0][0] == 120,
+          "%s %s" % (note2, wr2.calls))
+    wr3, ctl3, note3 = locate(0, 1005, moves=False)
+    check("滚了但窗口纹丝不动 → scroll-stuck（不无限滚）",
+          note3 == "scroll-stuck", note3)
+    wr4, ctl4, note4 = locate(0, 1005, sends=False)
+    check("滚轮发不出去（非前台 / 落点不是微信）→ scroll-blocked，且只试一次",
+          note4 == "scroll-blocked" and len(wr4.calls) == 1,
+          "%s %s" % (note4, wr4.calls))
+    wr5, ctl5, note5 = locate(0, 9999)
+    check("目标不在取回的历史窗口里 → not-in-db（而不是硬猜）",
+          note5 == "not-in-db", note5)
+    m3 = MediaDownloader.__new__(MediaDownloader)
+    wr6 = World(world_db, off=0)
+    m3._visible_rows = wr6.visible
+    m3._scroll_list = staticmethod(wr6.scroll)
+    ctl6, note6 = m3._locate_image_row(1005, None, world_db, None, 1, 2,
+                                       _t.time() + 30, max_scrolls=0)
+    check("max_scrolls=0 时一屏认不出就停（绝不滚界面）",
+          note6 == "scroll-limit" and wr6.calls == [], "%s %s" % (note6, wr6.calls))
+    wr7, ctl7, note7 = locate(0, 1005, rows_per_notch=0.5)
+    check("每格只滚半行时按实测修正：第二圈要滚 2 格而不是 1 格",
+          note7 == "aligned-after-2" and wr7.calls == [(-120, 2), (-120, 2)],
+          "%s %s" % (note7, wr7.calls))
 
     import uiautomation as _auto
     _orig_root = _auto.GetRootControl
