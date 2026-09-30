@@ -537,11 +537,14 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
 - `download_image_original` 通过UI自动化点击图片消息触发微信下载原图 / `download_image_original` triggers download via UI click
   - 本机已经有合格 `_h.dat` 时**直接解密落盘，不动界面** / a valid `_h.dat` already on disk is decrypted without touching the UI
   - 会切到对应会话；图片需已在消息区可见（无需滚动） / switches to the chat; images must be visible in the message area (no scrolling)
-  - 可视区里有多张图时，按「这条图片下面压了几张更新的图」把最可能的气泡排在第一个试，
-    每点一张都回来核对 `_h.dat` 是不是这条的；数不出来就逐个试，**不会盲滚**
+  - **「哪一行才是这条图」用 UIA 行序列认**：可视区里文本行的 `Name` 就是真实正文（会被截断，所以按前 10 字互相包含来比），图片行的 `Name` 恒为「图片」，整段序列与数据库的「文本/图片」序列滑窗对齐，对得上就直接点名目标行。至少要**两条文本锚点**且吻合度 ≥0.6 才放行——实机撞过可视区只剩一行时「吻合度 1.00」的假高分，那种情况任何偏移都算完美吻合，等于没有信息。认不出时退回「数它下面压了几张更新的图」，再不行逐个试（**不会盲滚**）
+  - 类名映射是**对着数据库逐行核过的**，别按直觉改：`mmui::ChatTextItemView` 才是文本行；`mmui::ChatBubbleItemView` 是文件/链接/卡片（库里正文近 1900 字 XML，UIA 只给 43 字摘要），把它当文本行会把整段对齐带偏；`mmui::ChatItemView` 是时间行、`mmui::ChatSystemInfoItemView` 是系统消息——两侧同时都不参与对齐
+  - **点气泡仍然只能用坐标**：`mmui::ChatBubbleReferItemView` 在 UIA 里是**叶子行**（用原始视图 `ControlFromPoint` 从行首横扫到 80% 行宽，返回的始终是这一行本身，没有缩略图子控件），而它虽然挂着 `InvokePattern`，**Invoke 是空操作**（实机 0 预览窗起步、Invoke 后 8 秒不出现，和 4.1.15 那个搜索按钮的 `Invoke()` 空操作同一个形状）。所以行矩形是**整行宽**（实测 2598px），缩略图只占其中 `+1.7%~+24.3%`
+  - **自己发出的图气泡在右边**：只按「左边缘 +12%」点就会点空——这是「点击打开图片时错位」最直接的一种形状。现在按发送方决定先点哪一侧（`sender_id == 2` → 先点右边），第一侧没点开再点该行另一侧
+  - 「有没有点开」只把**新出现**的预览窗算作成功（按 `NativeWindowHandle` 分辨）；屏幕上本来就开着预览窗时会先警告一句，因为旧窗口会被误判成刚点开的
   - 点完之后是**轮询等** `_h.dat` 出现并停止变大（到 `timeout` 为止），不再固定睡 3 秒取一次
   - 点击坐标依赖 WeChat 4.x 的 `mmui::ChatBubbleReferItemView` 布局（DPI 感知进程下按物理像素定位），不同窗口宽度/DPI 用相对偏移自动适配 / click coords rely on the `mmui::*` layout (physical pixels under a DPI-aware process); relative offset adapts to window width/DPI
-  - 缩略图 UIA 控件是空壳、拿不到真实位置，因此对消息列表图片用坐标点击；预览窗口内的「图片原始大小」按钮是完整 UIA 控件，用 `Click()` 点击 / image thumbnails expose no UIA children, so they are clicked by coordinate; the preview-window button is a real UIA control and is clicked via `Click()`
+  - 预览窗口内的「图片原始大小」按钮是完整 UIA 控件，用 `Click()` 点击 / the preview-window button is a real UIA control and is clicked via `Click()`
   - 预览窗里找不到「图片原始大小」按钮（这张本来就是原图／微信没给这个入口）会**明确警告并返回 `None`**，指引改用 `tier='best'`，不再和「下载没完成」混成同一种失败
 - 无 ffmpeg 时 wxgf 格式存为 `.wxgf` 原始数据兜底 / without ffmpeg, wxgf saved as `.wxgf`
 

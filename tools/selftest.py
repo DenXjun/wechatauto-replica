@@ -1703,6 +1703,152 @@ def t_image() -> None:
     check("同一 md5 只扫一次盘", len(ml.list_image_status('wxid_img')) == 2
           and scans == [MD5], str(scans))
 
+    print("[image] 用 UIA 行序列认出目标是哪一行")
+
+    class R:
+        def __init__(self, l, t, rr, b):
+            self.left, self.top, self.right, self.bottom = l, t, rr, b
+
+    class Row:
+        def __init__(self, cls, name, rect):
+            self.ClassName, self.Name, self.BoundingRectangle = cls, name, rect
+
+    class Lst:
+        def __init__(self, kids, rect):
+            self._k, self.BoundingRectangle = kids, rect
+
+        def GetChildren(self):
+            return self._k
+
+    IMG, TXT, TIME = ("mmui::ChatBubbleReferItemView", "mmui::ChatTextItemView",
+                      "mmui::ChatItemView")
+    band = R(466, 0, 3064, 246)                       # 实测：整行宽 2598
+    kids = [Row(TXT, "本周试卷", R(466, 0, 3064, 148)),
+            Row(TIME, "9月17日 19:50", R(466, 148, 3064, 230)),
+            Row(IMG, "图片", R(466, 230, 3064, 476)),
+            Row(IMG, "交易截图", band),                # 同类的引用卡片，不是图片气泡
+            Row(TXT, "收到", R(466, 476, 3064, 624)),
+            Row(IMG, "图片", R(466, 9000, 3064, 9246))]   # 矩形在列表外＝没渲染
+    lv = MediaDownloader.__new__(MediaDownloader)
+    ui = lv._visible_rows(Lst(kids, R(466, 0, 3064, 1210)))
+    check("只收图片行与文本行，时间行/引用卡片/未渲染行都不要",
+          [(k, n) for k, n, _c in ui] == [("text", "本周试卷"), ("image", "图片"),
+                                          ("text", "收到")],
+          str([(k, n) for k, n, _c in ui]))
+    check("认出来的那一行把控件原样带回来（后面要拿它算矩形）",
+          all(c.Name is not None for _k, _n, c in ui))
+    # 实机对着数据库核过的类名映射（同一会话同一屏）：把 ChatBubbleItemView 当成
+    # 文本行是**错**的——它是文件/链接/卡片，正文 1900 字 XML、UIA 只给 43 字摘要。
+    check("类名映射只有图片/文本两项（文件卡片、系统消息、时间行都不在内）",
+          MediaDownloader._UI_ROW_KIND == {
+              "mmui::ChatBubbleReferItemView": "image",
+              "mmui::ChatTextItemView": "text"}, str(MediaDownloader._UI_ROW_KIND))
+    check("数据库侧同理：只有「图片」「文本」参与",
+          MediaDownloader._DB_ROW_KIND == {"图片": "image", "文本": "text"})
+    mixed = Lst([Row("mmui::ChatBubbleItemView", "文件卡片摘要", R(466, 0, 3064, 284)),
+                 Row("mmui::ChatSystemInfoItemView", "系统消息一行", R(466, 284, 3064, 350)),
+                 Row("mmui::ChatItemView", "11:31", R(466, 350, 3064, 432)),
+                 Row(TXT, "本周试卷", R(466, 432, 3064, 580))], R(466, 0, 3064, 1210))
+    check("整屏都是文件卡片/系统消息/时间行时只留那一行文本",
+          [(k, n) for k, n, _c in lv._visible_rows(mixed)] == [("text", "本周试卷")],
+          str([(k, n) for k, n, _c in lv._visible_rows(mixed)]))
+
+    st = MediaDownloader._same_text
+    check("UIA 摘要截断了正文仍算同一条", st("本周试卷第一单元", "本周试卷第一") is True)
+    check("前 10 字不同就不是同一条", st("本周试卷", "下周试卷") is False)
+    check("空正文不参与判定（不当成互相包含）", st("", "任意") is False)
+
+    def dbspec(spec, first_id=100):
+        out = []
+        for i, (kind, txt) in enumerate(spec):
+            out.append({"kind": kind, "content": txt, "local_id": first_id + i})
+        return out
+
+    db = dbspec([("text", "早上好"), ("image", ""), ("text", "本周试卷第一单元测试"),
+                 ("image", ""), ("image", ""), ("text", "收到")], first_id=100)
+    ui2 = [("image", "图片", "A"), ("text", "本周试卷第一单元", "B"),
+           ("image", "图片", "C"), ("image", "图片", "D"), ("text", "收到", "E")]
+    check("整段序列对齐后点名目标（104 是可视下标 3，即第 4 行）",
+          lv._align_index(ui2, db, 104) == 3, str(lv._align_index(ui2, db, 104)))
+    check("103 → 可视下标 2；101 → 0（同一份对齐结果）",
+          lv._align_index(ui2, db, 103) == 2 and lv._align_index(ui2, db, 101) == 0)
+    check("目标 local_id=100 不在这个可视窗口里 → None（不硬猜）",
+          lv._align_index(ui2, db, 100) is None)
+    check("目标对齐到的是文本行而不是图片行 → None",
+          lv._align_index(ui2, db, 105) is None)
+    check("数据库比可视区还短 → None", lv._align_index(ui2, db[:2], 101) is None)
+    check("可视区为空 → None", lv._align_index([], db, 101) is None)
+    # 种类全对但正文对不上：吻合度不够就不给结果（只比种类太容易贴错位）
+    ui_bad = [("image", "图片", "A"), ("text", "话不对", "B"), ("image", "图片", "C"),
+              ("text", "题不对", "D"), ("text", "不", "E"), ("text", "对", "F")]
+    db_bad = dbspec([("image", ""), ("text", "本周试卷"), ("image", ""),
+                     ("text", "收到"), ("text", "好的"), ("text", "明白了")])
+    check("正文全对不上 → None（对齐分数没到阈值）",
+          lv._align_index(ui_bad, db_bad, 102) is None)
+    check("正文全对不上（一条锚点都没有）→ None",
+          lv._align_index(ui_bad, db_bad, 102) is None)
+    # 锚点够、但整体吻合度不够：分数阈值单独钉一条（否则上面那条分不清是被谁挡下的）
+    db3 = dbspec([("text", "甲"), ("text", "乙"), ("text", "丙"),
+                  ("text", "丁"), ("text", "戊"), ("image", "")], first_id=100)
+    ui3 = [("text", "甲", "A"), ("text", "乙", "B"), ("image", "图片", "C"),
+           ("image", "图片", "D"), ("image", "图片", "E"), ("image", "图片", "F")]
+    check("两条锚点够、但 6 行里只吻合 3 行（0.5<0.6）→ None",
+          lv._align_index(ui3, db3, 105) is None)
+    check("把分数阈值放宽到 0.5 就放行（钉住是分数在挡，不是锚点）",
+          lv._align_index(ui3, db3, 105, min_score=0.5) == 5)
+    # 实机撞到的假高分：可视区只剩一行时，任何偏移都「完美吻合」
+    one_row = [("image", "图片", "A")]
+    check("可视区只剩一行时不给结果（吻合度 1.00 是假的，没有文本锚点）",
+          lv._align_index(one_row, db, 101) is None)
+    check("显式不要锚点时才给结果（钉住 min_text_anchors 确实在挡）",
+          lv._align_index(one_row, db, 101, min_text_anchors=0) == 0)
+    one_anchor = [("image", "图片", "A"), ("text", "收到", "E")]
+    check("只有一条文本锚点也不给结果", lv._align_index(one_anchor, db, 103) is None)
+    check("两条锚点才放行（ui2 里「本周试卷…」+「收到」正好两条）",
+          lv._align_index(ui2, db, 103, min_text_anchors=2) == 2)
+
+    xs = MediaDownloader._bubble_click_xs
+    wide = R(466, 0, 3064, 246)
+    check("别人发的：先点左边（实测内容带 +1.7%~+24.3% 之内）",
+          xs(wide, False)[0] == 466 + int(2598 * 0.12)
+          and 466 + int(2598 * 0.017) <= xs(wide, False)[0] <= 466 + int(2598 * 0.243),
+          str(xs(wide, False)))
+    check("自己发的：先点右边（气泡在右侧，只按左边点就是「点击错位」）",
+          xs(wide, True)[0] == 3064 - int(2598 * 0.12)
+          and xs(wide, True)[0] > xs(wide, False)[0], str(xs(wide, True)))
+    check("两侧都给出（第一侧没点开还能试另一侧）", len(xs(wide, True)) == 2
+          and set(xs(wide, True)) == set(xs(wide, False)))
+
+    import uiautomation as _auto
+    _orig_root = _auto.GetRootControl
+
+    class FakeWin:
+        def __init__(self, cls, h):
+            self.ClassName, self.NativeWindowHandle = cls, h
+
+    class FakeRoot:
+        def GetChildren(self):
+            return [FakeWin("mmui::PreviewWindow", 11), FakeWin("mmui::MainWindow", 22),
+                    FakeWin("Qt51514QWindowIcon", 33)]
+
+    try:
+        _auto.GetRootControl = lambda: FakeRoot()
+        got = MediaDownloader._preview_windows()
+        check("只收预览窗，并把句柄带出来（用来分辨新开的还是早就开着的）",
+              [h for h, _w in got] == [11], str([h for h, _w in got]))
+    finally:
+        _auto.GetRootControl = _orig_root
+
+    class Boom:
+        def GetChildren(self):
+            raise RuntimeError("树没了")
+
+    _auto.GetRootControl = lambda: Boom()
+    try:
+        check("读不到根控件时返回空列表而不是抛", MediaDownloader._preview_windows() == [])
+    finally:
+        _auto.GetRootControl = _orig_root
+
     for p in tmpdirs:
         shutil.rmtree(p, ignore_errors=True)
 

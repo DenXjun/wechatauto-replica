@@ -598,6 +598,137 @@ class MediaDownloader:
         chosen = ordered.pop(idx)
         return [chosen[0]] + [ch for ch, _ in ordered]
 
+    # 可视行类名 → 参与对齐的种类。实机对着数据库核过一遍（同一会话同一屏）：
+    #   ``mmui::ChatTextItemView``          = 文本（Name 是被截断的正文）
+    #   ``mmui::ChatBubbleReferItemView``   = 图片气泡，但**只有 Name=='图片' 的那几行**
+    #       （同一个类名还用来渲染引用卡片等，Name 是摘要文字）
+    #   ``mmui::ChatBubbleItemView``        = 文件/链接/卡片（库里正文 ~1900 字 XML，
+    #       UIA 只给 43 字摘要）——**不是文本行**，按直觉映射成 text 会把整段对齐带偏
+    #   ``mmui::ChatSystemInfoItemView``    = 系统消息
+    #   ``mmui::ChatItemView``              = 时间分隔行（Name 形如 ``11:31``）
+    # 后三类不参与对齐：微信的时间文案规则（今天/昨天/M月D日/星期）不值得复刻，
+    # 而两侧同时丢掉同一种行不影响对齐结果。
+    _UI_ROW_KIND = {"mmui::ChatBubbleReferItemView": "image",
+                    "mmui::ChatTextItemView": "text"}
+    _DB_ROW_KIND = {"图片": "image", "文本": "text"}
+
+    def _visible_rows(self, lst) -> list:
+        """可视区的消息行 ``[(种类, Name, 控件), ...]``，自上而下＝自旧到新。
+
+        矩形中心不在列表内的行不要：虚拟化列表会报出还没画出来的行，点上去只会
+        ``Can not move cursor``。
+        """
+        out = []
+        try:
+            children = lst.GetChildren()
+            lr = lst.BoundingRectangle
+        except Exception as e:
+            wxlog.debug("读消息列表子节点失败：%s", e)
+            return out
+        for ch in children:
+            try:
+                kind = self._UI_ROW_KIND.get(ch.ClassName or "")
+                if kind is None:
+                    continue
+                if kind == "image" and (ch.Name or "") != "图片":
+                    continue      # 引用卡片等也用这个类名，但不是图片气泡
+                r = ch.BoundingRectangle
+                cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
+                if not (lr.left <= cx <= lr.right and lr.top <= cy <= lr.bottom):
+                    wxlog.debug("%s行矩形在列表外（未渲染）：(%d,%d,%d,%d)",
+                                kind, r.left, r.top, r.right, r.bottom)
+                    continue
+                out.append((kind, ch.Name or "", ch))
+            except Exception as e:
+                wxlog.debug("读列表子节点失败：%s", e)
+                continue
+        return out
+
+    @staticmethod
+    def _same_text(a: str, b: str) -> bool:
+        """UIA 摘要会截断正文，所以按「前 10 字互相包含」判同一条消息。"""
+        a, b = (a or "").strip(), (b or "").strip()
+        if not a or not b:
+            return False
+        return a == b or a[:10] in b or b[:10] in a
+
+    def _align_index(self, ui, db, target_local_id, min_score: float = 0.6,
+                     min_text_anchors: int = 2):
+        """把可视行序列与数据库行序列对齐，返回目标在 ``ui`` 里的下标（认不出给 None）。
+
+        可视区只是整段历史中间的一小窗，所以整段滑动数据库窗口、取吻合度最高的偏移；
+        文本行还要求正文前缀一致（只比种类太松，容易贴错位）。吻合度不够、目标不在这
+        个窗口里、对齐结果说目标不是图片行——一律返回 ``None``：宁可不点，也不要点
+        到别人的图上。
+
+        ``min_text_anchors``：**至少要两条正文对得上的文本行**才认这份对齐。实机就
+        撞上过可视区只剩一行、吻合度 1.00 的假高分——那种情况下任何偏移都"完美吻合"，
+        等于没有信息；锚不住就退回 :meth:`_order_bubbles` 的计数法。
+
+        Args:
+            ui: :meth:`_visible_rows` 的结果。
+            db: ``[{'kind','content','local_id'}, ...]``，**自旧到新**。
+        """
+        n, m = len(ui), len(db)
+        if not n or m < n:
+            return None
+        try:
+            ti = next(i for i, d in enumerate(db)
+                      if d.get("local_id") == target_local_id)
+        except StopIteration:
+            return None
+        best = None
+        for o in range(0, m - n + 1):
+            hit = anchors = 0
+            for i in range(n):
+                kind, name, _c = ui[i]
+                d = db[o + i]
+                if d["kind"] != kind:
+                    continue
+                if kind == "text":
+                    if not self._same_text(name, d.get("content") or ""):
+                        continue
+                    anchors += 1
+                hit += 1
+            score = hit / float(n)
+            if best is None or score > best[0]:
+                best = (score, o, anchors)
+        if best is None or best[0] < float(min_score) or best[2] < int(min_text_anchors):
+            return None
+        idx = ti - best[1]
+        if not (0 <= idx < n) or ui[idx][0] != "image":
+            return None
+        return idx
+
+    @staticmethod
+    def _bubble_click_xs(rect, is_self) -> list:
+        """缩略图在这一行里的可点 x，先按发送方那一侧，再试另一侧。
+
+        行矩形是**整行宽**（实测 2598px），缩略图只占其中一小块：200% 缩放下内容带
+        在左边缘 +1.7%~+24.3%（绝对 x=510~1098），所以 12% 落在带内。但**自己发的
+        图气泡在右边**，只按左边点就会点空——这是「点击打开图片时错位」最直接的一种
+        形状，所以两侧都给，先给该中的那侧。
+        """
+        off = int((rect.right - rect.left) * 0.12)
+        left, right = rect.left + off, rect.right - off
+        return [right, left] if is_self else [left, right]
+
+    @staticmethod
+    def _preview_windows():
+        """当前所有预览窗 ``[(窗口句柄, 控件), ...]``（句柄用来分辨「新开的」还是「早就开着的」）。"""
+        import uiautomation as auto
+        out = []
+        try:
+            for w in auto.GetRootControl().GetChildren():
+                if "PreviewWindow" in (w.ClassName or ""):
+                    try:
+                        out.append((w.NativeWindowHandle, w))
+                    except Exception:
+                        out.append((id(w), w))
+        except Exception:
+            pass
+        return out
+
     def _write_decrypted(self, data: bytes, stem: str, save_dir: Optional[str]) -> str:
         """按文件头判格式落盘（wxgf 先试转码），返回路径。"""
         if data[:3] == b"\xff\xd8\xff":
@@ -1093,7 +1224,6 @@ class MediaDownloader:
                 "%s_%s" % (user, local_id), save_dir)
 
         from .uia_driver import WeChatUIA
-        import uiautomation as auto
         from .guia import WinInput
 
         _uia = WeChatUIA()
@@ -1132,25 +1262,10 @@ class MediaDownloader:
             wxlog.debug("消息列表 rect=(%d,%d,%d,%d) ChatWith=%s",
                         lst_rect.left, lst_rect.top, lst_rect.right,
                         lst_rect.bottom, opened)
-            images = []
-            for ch in lst.GetChildren():
-                try:
-                    cn = ch.ClassName or ""
-                    nm = ch.Name or ""
-                    if cn == "mmui::ChatBubbleReferItemView" and nm == "图片":
-                        r = ch.BoundingRectangle
-                        cx = int((r.left + r.right) / 2)
-                        cy = int((r.top + r.bottom) / 2)
-                        in_lst = (lst_rect.left <= cx <= lst_rect.right and
-                                  lst_rect.top <= cy <= lst_rect.bottom)
-                        wxlog.debug("图片气泡 rect=(%d,%d,%d,%d) 在列表内=%s",
-                                    r.left, r.top, r.right, r.bottom, in_lst)
-                        if in_lst:
-                            images.append(ch)
-                except Exception as e:
-                    wxlog.debug("读列表子节点失败：%s", e)
-                    continue
-            wxlog.debug("列表内图片气泡：%d 个", len(images))
+            ui = self._visible_rows(lst)
+            images = [c for k, _n, _c in ui if k == "image"]
+            wxlog.debug("可视消息行 %d 行（其中图片行 %d 行）ChatWith=%s",
+                        len(ui), len(images), opened)
             if not images:
                 # RecyclerListView 是虚拟化的，只实例化可视区那十来行；目标
                 # 那条图没在视野里就扫不到，这里只报不猜（滚动定位另说）。
@@ -1158,14 +1273,39 @@ class MediaDownloader:
                               "（会话已打开的话，把窗口滚到那条消息再试）")
                 return None
 
-            # 消息列表是虚拟化的，只能看见可视区那几行；而「这条图上面还有几张图」
-            # 数据库里数得出来。据此把最可能命中的气泡排到第一个，而不是从最上面
-            # 那张开始一张张点（每点一次都要等预览窗，全点一遍很慢）。
-            n_newer = self._newer_image_count(user, row.get("sort_seq"))
-            order = self._order_bubbles(
-                [(ch, ch.BoundingRectangle.top) for ch in images], n_newer)
-            wxlog.debug("目标之前有 %d 张更新的图片，可视气泡 %d 个，尝试顺序已按此排定",
-                        n_newer, len(order))
+            # 「哪一行才是这条图」：文本行的 Name 就是真实正文、时间行也在序列里，
+            # 所以整段可视行序列可以和数据库对齐，对齐成功后直接点名目标行——
+            # 比「数它下面压了几张更新的图」准得多（两张图挨着时数错就点到别人的图）。
+            target_ch = None
+            try:
+                recent = self.db.get_messages(user, limit=120)      # 降序
+                db_seq = [{"kind": self._DB_ROW_KIND.get(r.get("type") or ""),
+                           "content": r.get("content") or "",
+                           "local_id": r.get("local_id")}
+                          for r in reversed(recent)]                # 自旧到新
+                db_seq = [d for d in db_seq if d["kind"]]
+                idx = self._align_index(ui, db_seq, local_id)
+                if idx is not None:
+                    target_ch = ui[idx][2]
+                    wxlog.debug("按 UIA 行序列认出目标：可视第 %d/%d 行（比对窗口 %d 行）",
+                                idx + 1, len(ui), len(db_seq))
+            except Exception as e:
+                wxlog.debug("行序列对齐没做成（%s），退回按图片计数", type(e).__name__)
+            if target_ch is None:
+                n_newer = self._newer_image_count(user, row.get("sort_seq"))
+                order = self._order_bubbles(
+                    [(ch, ch.BoundingRectangle.top) for ch in images], n_newer)
+                wxlog.debug("没认出具体哪一行：目标下面有 %d 张更新的图，可视气泡 %d 个，"
+                            "按此排定尝试顺序", n_newer, len(order))
+            else:
+                order = [target_ch] + [ch for ch in images if ch is not target_ch]
+            is_self = (row.get("sender_id") == 2)
+            # 屏幕上已经开着预览窗时，「有没有新窗口」这个判据会失真（实测撞上过一次
+            # 假成功），所以记下已有句柄，只把**新出现**的窗口算作点开。
+            before = {h for h, _w in self._preview_windows()}
+            if before:
+                wxlog.warning("屏幕上已有 %d 个预览窗：本轮只把新出现的窗口算作点开成功"
+                              "（先手动关掉再跑，判据更干净）", len(before))
             deadline = time.time() + max(3.0, float(timeout))
 
             for img_ch in order:
@@ -1174,40 +1314,37 @@ class MediaDownloader:
                                   timeout, len(order))
                     break
                 r = img_ch.BoundingRectangle
-                # UIA 矩形是全宽列表项；实际图片缩略图在左侧。
-                # 实测命中带约为 left+8.7%宽度 ~ left+15.8%宽度，中心≈12%。
-                # 用相对偏移（而非固定像素），窗口宽度/DPI 变化时可自适应。
-                cx = r.left + int((r.right - r.left) * 0.12)
                 cy = int((r.top + r.bottom) / 2)
-                wxlog.debug("点击图缩略图 (%d,%d)", cx, cy)
-
-                inp.real_click(cx, cy)
-
                 preview_win = btn = None
-                until = min(deadline, time.time() + 8.0)
-                while time.time() < until:
-                    try:
-                        root = auto.GetRootControl()
-                        candidates = [w for w in root.GetChildren()
-                                      if "PreviewWindow" in (w.ClassName or "")]
-                    except Exception:
-                        candidates = []
-                    for w in candidates:
-                        b = self._find_preview_button(w, "图片原始大小")
-                        if b is not None:
-                            preview_win, btn = w, b
-                            break
-                    if btn is not None:
+                # 行矩形是**整行宽**（实测 2598px），缩略图只占其中一小块，而且
+                # 自己发的图气泡在右边——先点该中的那一侧，没点开再试另一侧。
+                for cx in self._bubble_click_xs(r, is_self):
+                    if time.time() >= deadline:
                         break
-                    if candidates and preview_win is None:
-                        # 预览窗先出来了、按钮可能还在渲染，先记下再轮询一轮
-                        preview_win = max(candidates, key=lambda w: (
-                            (w.BoundingRectangle.right - w.BoundingRectangle.left) *
-                            (w.BoundingRectangle.bottom - w.BoundingRectangle.top)))
-                    time.sleep(0.5)
+                    wxlog.debug("点击图缩略图 (%d,%d) 行=(%d,%d,%d,%d) 自己发的=%s",
+                                cx, cy, r.left, r.top, r.right, r.bottom, is_self)
+                    inp.real_click(cx, cy)
+                    until = min(deadline, time.time() + 8.0)
+                    while time.time() < until:
+                        fresh = [(h, w) for h, w in self._preview_windows()
+                                 if h not in before]
+                        for _h, w in fresh:
+                            b = self._find_preview_button(w, "图片原始大小")
+                            if b is not None:
+                                preview_win, btn = w, b
+                                break
+                            if preview_win is None:
+                                preview_win = w    # 窗先出来、按钮可能还在渲染
+                        if btn is not None:
+                            break
+                        time.sleep(0.5)
+                    if preview_win is not None:
+                        break
+                    if time.time() < deadline:
+                        wxlog.debug("这一侧没点开，试该行的另一侧")
 
                 if preview_win is None:
-                    wxlog.debug("点击后没出现预览窗（点的不是这张图 / 界面没响应），换下一个气泡")
+                    wxlog.debug("点击后没出现新的预览窗（点偏了 / 点的不是这张图），换下一个气泡")
                     continue
                 if btn is None:
                     wxlog.warning(
