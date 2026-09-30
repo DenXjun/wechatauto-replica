@@ -1933,16 +1933,39 @@ def t_image() -> None:
         def __init__(self, cls, h):
             self.ClassName, self.NativeWindowHandle = cls, h
 
-    class FakeRoot:
-        def GetChildren(self):
-            return [FakeWin("mmui::PreviewWindow", 11), FakeWin("mmui::MainWindow", 22),
-                    FakeWin("Qt51514QWindowIcon", 33)]
+    class FakeTop:
+        def __init__(self, cls, name, kids=(), h=0):
+            self.ClassName, self.Name = cls, name
+            self._k, self.NativeWindowHandle = list(kids), h
 
+        def GetChildren(self):
+            return list(self._k)
+
+    class FakeRoot:
+        def __init__(self, kids):
+            self._k = kids
+
+        def GetChildren(self):
+            return self._k
+
+    inner = FakeTop("mmui::PreviewWindow", "图片和视频", h=0)
+    shape1 = FakeTop("mmui::PreviewWindow", "Weixin", h=11)          # 直接就是预览窗
+    shape2 = FakeTop("Qt51514QWindowIcon", "图片和视频", [inner], 22)  # 隔一层（实机第二种）
+    other = FakeTop("Qt51514QWindowIcon", "微信", h=33)
+    impostor = FakeTop("Notepad", "图片和视频", h=44)                 # 同名但不是 Qt 窗口
     try:
-        _auto.GetRootControl = lambda: FakeRoot()
+        _auto.GetRootControl = lambda: FakeRoot([shape1, shape2, other, impostor])
         got = MediaDownloader._preview_windows()
-        check("只收预览窗，并把句柄带出来（用来分辨新开的还是早就开着的）",
-              [h for h, _w in got] == [11], str([h for h, _w in got]))
+        check("两种实机形状都能找到预览窗（顶层直接是 / 隔一层的 Qt 窗口）",
+              len(got) == 2, str([h for h, _w in got]))
+        check("句柄取的是顶层窗口（用来分辨新开的还是早就开着的）",
+              sorted(h for h, _w in got) == [11, 22], str(sorted(h for h, _w in got)))
+        check("交给调用方的控件一律是 PreviewWindow 那一层",
+              all("PreviewWindow" in (w.ClassName or "") for _h, w in got),
+              str([w.ClassName for _h, w in got]))
+        check("主窗和同名非 Qt 窗口不算预览窗",
+              all((w.ClassName or "") != "Notepad" and (w.Name or "") != "微信"
+                  for _h, w in got))
     finally:
         _auto.GetRootControl = _orig_root
 
@@ -1976,11 +1999,17 @@ def t_image() -> None:
             return []
 
     class FakeUIA:
+        chat = None
+        no_hwnd = False
+
         def __init__(self, *a, **k):
             pass
 
         def ensure_window(self):
             return True
+
+        def current_chat(self):
+            return FakeUIA.chat
 
         def _message_list(self):
             return FakeLst()
@@ -1988,14 +2017,23 @@ def t_image() -> None:
         def _force_foreground(self, hwnd):
             return True
 
+        def _wechat_hwnds(self, diag=None):
+            return [] if FakeUIA.no_hwnd else [555]
+
+        def _pid_from_hwnd(self, h):
+            return None if FakeUIA.no_hwnd else 4321
+
     class FakeGui:
         main_hwnd, pid = 1234, 4321
+
+    chatwith = []
 
     class FakeWX:
         def __init__(self, *a, **k):
             self._gui = FakeGui()
 
         def ChatWith(self, who):
+            chatwith.append(who)
             return True
 
     clicks = []
@@ -2021,9 +2059,27 @@ def t_image() -> None:
                     "content": b""}
 
         def get_messages(self, user, limit=20, offset=0):
-            return []
+            # 降序：让 db_seq 非空，否则函数根本不会去调 _locate_image_row
+            return [{"type": "图片", "content": "", "local_id": 7},
+                    {"type": "文本", "content": "正文一行", "local_id": 6},
+                    {"type": "图片", "content": "", "local_id": 5}]
 
-    def smoke(sender):
+    plans = []
+
+    class FakeBtn:
+        Name = "图片原始大小"
+
+        def __init__(self):
+            self.BoundingRectangle = R(466, 74, 522, 130)
+            self.clicked = 0
+
+        def Click(self):
+            self.clicked += 1
+
+    def smoke(sender, pid_ok=True, has_button=True, chat=None, pre_open=False):
+        FakeGui.pid = 4321 if pid_ok else None
+        FakeUIA.no_hwnd = not pid_ok
+        FakeUIA.chat = chat
         ms = MediaDownloader.__new__(MediaDownloader)
         ms.save_dir = tempfile.mkdtemp(prefix='wxsmoke-')
         tmpdirs.append(ms.save_dir)
@@ -2031,10 +2087,21 @@ def t_image() -> None:
         ms._image_files = lambda u, m: {}          # 本机没有原图 → 必须走界面
         ms._visible_rows = lambda lst: [("image", "图片", Ctl(700)),
                                         ("text", "正文一行", Ctl(950))]
-        ms._locate_image_row = lambda lid, lst, dbs, uia, h, p, dl, max_scrolls=6: \
-            (ms._visible_rows(lst)[0][2], "aligned")
-        ms._preview_windows = lambda: [(99, FakePreview())]
-        ms._find_preview_button = lambda w, name: None   # 预览窗里没这个按钮
+        btn = FakeBtn()
+
+        def _loc(lid, lst, dbs, uia, h, p, dl, max_scrolls=6):
+            plans.append(max_scrolls)
+            return ms._visible_rows(lst)[0][2], "aligned"
+        ms._locate_image_row = _loc
+        # 「只有新出现的预览窗才算点开」：点击之前屏上没有窗，点击之后才有；
+        # pre_open=True 模拟「本来就开着一张大图」——那种窗不能当成果。
+        ms._preview_windows = lambda: ([(99, FakePreview())]
+                                       if (pre_open or clicks) else [])
+        ms._find_preview_button = lambda w, name: (btn if has_button else None)
+        ms._wait_h_dat = lambda u, m, mid_sz=0, min_bytes=1024, until=None: (
+            "C:\\tmp\\x_h.dat", 5000)             # 点完按钮 → 原图落盘
+        ms._find_h_dat = lambda u, m: "C:\\tmp\\x_h.dat"
+        ms.decrypt_image = lambda p, a=None, x=None: JPEG
         ua, wxm, gu = _ud.WeChatUIA, _wxm.WeChat, _g.WinInput
         _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = FakeUIA, FakeWX, FakeInput
         try:
@@ -2042,17 +2109,46 @@ def t_image() -> None:
                                              chat_name="显示名")
         finally:
             _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = ua, wxm, gu
-        return out
+            FakeUIA.no_hwnd = False
+            FakeGui.pid = 4321
+        return out, btn
 
     clicks.clear()
-    check("函数体能走完（没走到就报 NameError/AttributeError）", smoke(None) is None)
+    chatwith.clear()
+    plans.clear()
+    out0, btn0 = smoke(None, chat="显示名")      # 已经在目标会话里
+    check("函数体走完并解密落盘（没走到就报 NameError/AttributeError）",
+          bool(out0) and out0.endswith("wxid_img_7.jpg") and _os.path.exists(out0),
+          str(out0))
     check("走到了点击那一步（不是提前 return）", len(clicks) >= 1, str(clicks))
     check("别人发的：先点左边 x=777", clicks and clicks[0][0] == 777, str(clicks[:2]))
+    check("找到按钮后按 UIA 名字点它，不按比例猜坐标", btn0.clicked == 1, str(btn0.clicked))
+    check("已经在目标会话里 → 不再搜索进入（批量下载多张图时不反复搜）",
+          chatwith == [], str(chatwith))
+    check("拿得到微信进程 id 时才允许滚界面（传进去的 max_scrolls 非 0）",
+          plans and plans[-1] > 0, str(plans))
     clicks.clear()
-    smoke(2)
+    smoke(2, chat="显示名")
     check("自己发的（sender_id==2）：先点右边 x=2753",
           clicks and clicks[0][0] == 2753, str(clicks[:2]))
     check("行中心取的是那一行的中线", clicks and clicks[0][1] == 700 + 123, str(clicks[:1]))
+    chatwith.clear()
+    smoke(None, chat="别的会话")
+    check("不是目标会话 → 照常搜索进入", chatwith == ["显示名"], str(chatwith))
+    chatwith.clear()
+    smoke(None, chat=None)
+    check("读不到当前会话标题时也照常进入（保守：宁可多搜一次）",
+          chatwith == ["显示名"], str(chatwith))
+    plans.clear()
+    smoke(None, pid_ok=False, chat="显示名")
+    check("拿不到进程 id → 绝不滚界面（max_scrolls=0，落点无法校验）",
+          plans and plans[-1] == 0, str(plans))
+    clicks.clear()
+    check("预览窗里没有「图片原始大小」按钮时明确失败并返回 None",
+          smoke(None, chat="显示名", has_button=False)[0] is None)
+    clicks.clear()
+    check("屏上本来就开着预览窗时不算「点开成功」（只认新出现的窗口）",
+          smoke(None, chat="显示名", pre_open=True)[0] is None)
 
     for p in tmpdirs:
         shutil.rmtree(p, ignore_errors=True)

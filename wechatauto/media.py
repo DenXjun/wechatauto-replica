@@ -744,20 +744,47 @@ class MediaDownloader:
         left, right = rect.left + off, rect.right - off
         return [right, left] if is_self else [left, right]
 
+    # 预览窗的顶层形状实测有两种（同一台机、同一个微信版本）：
+    #   ① 桌面的直接子节点就是 ``mmui::PreviewWindow``（Name 是 'Weixin'）；
+    #   ② 顶层是 ``Qt51514QWindowIcon``、标题「图片和视频」，``mmui::PreviewWindow``
+    #      在它**里面一层**。
+    # 只按直接子节点的类名筛的话，第 ② 种永远找不到——于是「图片原始大小」按钮
+    # 一次都没被点过，看起来就像「点击不对 / 比例错了」。
+    _PREVIEW_TITLES = ("图片和视频",)
+
     @staticmethod
     def _preview_windows():
-        """当前所有预览窗 ``[(窗口句柄, 控件), ...]``（句柄用来分辨「新开的」还是「早就开着的」）。"""
+        """当前所有预览窗 ``[(窗口句柄, 控件), ...]``。
+
+        句柄用来分辨「新出现的」和「本来就开着的」；控件一律给 ``mmui::PreviewWindow``
+        那一层（两种形状都能对齐到同一层，调用方按子树找按钮）。
+        """
         import uiautomation as auto
         out = []
         try:
-            for w in auto.GetRootControl().GetChildren():
-                if "PreviewWindow" in (w.ClassName or ""):
-                    try:
-                        out.append((w.NativeWindowHandle, w))
-                    except Exception:
-                        out.append((id(w), w))
+            tops = auto.GetRootControl().GetChildren()
         except Exception:
-            pass
+            return out
+        for w in tops:
+            cls = w.ClassName or ""
+            inner = None
+            if "PreviewWindow" in cls:
+                inner = w
+            elif (w.Name or "").strip() in MediaDownloader._PREVIEW_TITLES \
+                    and cls.startswith("Qt"):
+                try:
+                    kids = w.GetChildren()
+                except Exception:
+                    kids = []
+                inner = next((k for k in kids
+                              if "PreviewWindow" in (k.ClassName or "")), w)
+            if inner is None:
+                continue
+            try:
+                h = w.NativeWindowHandle or id(w)
+            except Exception:
+                h = id(w)
+            out.append((h, inner))
         return out
 
     def _write_decrypted(self, data: bytes, stem: str, save_dir: Optional[str]) -> str:
@@ -1340,25 +1367,53 @@ class MediaDownloader:
             return None
         time.sleep(1.0)
 
+        # 批量下载同一个会话的多张图时，每张都重新搜索进会话是没必要的开销（也是
+        # 一次真实的界面写动作）。已经在目标会话里就跳过搜索——用输入框的 Name 判，
+        # 它一直是会话标题，不是正文。
+        want_chat = (chat_name or user or "").strip()
         opened = False
+        cur = None
+        try:
+            cur = (_uia.current_chat() or "").strip()
+        except Exception:
+            cur = None
+        if want_chat and cur == want_chat:
+            opened = True
+            wxlog.debug("已在会话 %r 里，跳过搜索进入", want_chat)
         wx = None
-        for _retry in range(3):
-            try:
-                from .wx import WeChat
-                wx = WeChat()
-                opened = wx.ChatWith(chat_name or user)
-                time.sleep(2.0)
-                break
-            except Exception as e:
-                wxlog.debug("ChatWith 第 %d 次抛错：%s: %s",
-                            _retry, type(e).__name__, str(e)[:100])
-                time.sleep(1.0)
+        if not opened:
+            for _retry in range(3):
+                try:
+                    from .wx import WeChat
+                    wx = WeChat()
+                    opened = wx.ChatWith(want_chat)
+                    time.sleep(2.0)
+                    break
+                except Exception as e:
+                    wxlog.debug("ChatWith 第 %d 次抛错：%s: %s",
+                                _retry, type(e).__name__, str(e)[:100])
+                    time.sleep(1.0)
         hwnd = pid = None
         try:                              # 滚动定位要用的两样：主窗句柄 + 微信进程 id
             hwnd = wx._gui.main_hwnd or None
             pid = wx._gui.pid or None
         except Exception:
             pass
+        if not pid:
+            # 跳过搜索时没有 WeChat 对象。滚轮的落点校验不能因此省掉——
+            # 2026-09-25 就有一次自检把滚轮打进了压在微信上面的 IDE。
+            try:
+                hs = _uia._wechat_hwnds()
+                if hs:
+                    hwnd = hs[0]
+                    pid = _uia._pid_from_hwnd(hwnd)
+            except Exception:
+                pass
+        if scroll and not pid:
+            wxlog.warning("拿不到微信进程 id，本轮不滚动界面（避免把滚轮打进别的程序）；"
+                          "要强行只在当前屏找图可以传 scroll=False")
+        # 滚动的唯一硬前提：能校验落点窗口属于微信。拿不到 pid 就退化成「只认当前屏」。
+        scroll_ok = bool(scroll and pid)
 
         clicked = False
         try:
@@ -1397,7 +1452,7 @@ class MediaDownloader:
                     target_ch, note = self._locate_image_row(
                         local_id, lst, db_seq, _uia, hwnd, pid,
                         min(deadline, time.time() + max(3.0, float(timeout) * 0.5)),
-                        max_scrolls=max(0, int(max_scrolls)) if scroll else 0)
+                        max_scrolls=max(0, int(max_scrolls)) if scroll_ok else 0)
                 except Exception as e:
                     wxlog.debug("定位图片行抛错（%s），退回按图片计数", type(e).__name__)
                     note = "error"

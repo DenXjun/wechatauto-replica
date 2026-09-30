@@ -546,6 +546,10 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
   - **点气泡仍然只能用坐标**：`mmui::ChatBubbleReferItemView` 在 UIA 里是**叶子行**（用原始视图 `ControlFromPoint` 从行首横扫到 80% 行宽，返回的始终是这一行本身，没有缩略图子控件），而它虽然挂着 `InvokePattern`，**Invoke 是空操作**（实机 0 预览窗起步、Invoke 后 8 秒不出现，和 4.1.15 那个搜索按钮的 `Invoke()` 空操作同一个形状）。所以行矩形是**整行宽**（实测 2598px），缩略图只占其中 `+1.7%~+24.3%`
   - **自己发出的图气泡在右边**：只按「左边缘 +12%」点就会点空——这是「点击打开图片时错位」最直接的一种形状。现在按发送方决定先点哪一侧（`sender_id == 2` → 先点右边），第一侧没点开再点该行另一侧
   - 「有没有点开」只把**新出现**的预览窗算作成功（按 `NativeWindowHandle` 分辨）；屏幕上本来就开着预览窗时会先警告一句，因为旧窗口会被误判成刚点开的
+  - **预览窗有两种形状**（同一台机、同一版本实测都出现过）：① 桌面的直接子节点就是 `mmui::PreviewWindow`；② 顶层是 `Qt51514QWindowIcon`、标题「图片和视频」，`mmui::PreviewWindow` 在**它里面一层**。只按「顶层子节点的类名含 PreviewWindow」筛，第 ② 种永远找不到——表现就是「点了没反应 / 按钮点不对」，而实际一次都没走到找按钮那步
+  - 预览窗工具栏按钮全是真 UIA 控件，按名字取：`置顶 / 上一张 / 下一张 / 预览 / 放大 / 缩小 / 图片原始大小 / 旋转 / 编辑 / 翻译 / 提取文字 / 保存 / 更多`，加标题栏 `最小化 / 最大化 / 关闭`。「图片原始大小」用 `Click()`，**不要按窗口比例猜坐标**
+  - **批量下载同一会话的多张图不再反复搜索进入**：进函数先读当前会话标题（`current_chat()`，取自输入框的 Name——它一直是会话标题而不是正文），已经是目标会话就跳过搜索；读不到标题时保守照常进入
+  - 滚动有一个硬前提：**拿得到微信进程 id**。拿不到就退化成「只认当前屏、绝不滚」（`max_scrolls=0`）并打一条警告——落点无法校验时滚轮可能打进压在微信上面的别的程序
   - 点完之后是**轮询等** `_h.dat` 出现并停止变大（到 `timeout` 为止），不再固定睡 3 秒取一次
   - 点击坐标依赖 WeChat 4.x 的 `mmui::ChatBubbleReferItemView` 布局（DPI 感知进程下按物理像素定位），不同窗口宽度/DPI 用相对偏移自动适配 / click coords rely on the `mmui::*` layout (physical pixels under a DPI-aware process); relative offset adapts to window width/DPI
   - 预览窗口内的「图片原始大小」按钮是完整 UIA 控件，用 `Click()` 点击 / the preview-window button is a real UIA control and is clicked via `Click()`
