@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.4.1
+> 当前版本：1.2.4.2
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -60,6 +60,18 @@
 ---
 
 ## 版本记录
+
+### v1.2.4.2（2026-09-30）
+
+- **修复：「只能下到缩略图，下不到原图」**（附了机器人日志：「只要原图，先不用缩略图」后面是一轮一轮不收敛的重试）。三个互相独立的因，**没一个是解密问题**：
+  - **`download_image()` 压根不看 `_h.dat`**（那才是真原图），而且拿到压缩版时文件名和原图一模一样（`<user>_<local_id>.jpg`），只要原图的调用方只能靠文件大小猜，于是永远在重试。现在档位由 `tier=` 明说：`'original'`（本机没有原图就返回 `None`，**不悄悄降级**）、`'best'`（原图 → 压缩 → 缩略图）、`'mid'`、`'thumb'`，并且把档位写进文件名（`_h` / 无 / `_thumb`）；不传 `tier` 与旧版逐字一致。
+  - **`download_image_original()` 里那道绝对门槛 `getsize(_h.dat) > 102400`**——它是用来判「压缩版还没下完」的。本机 705 个 `_h.dat` 实测：最小 575B、p10 4.3KB、**p50 91.5KB**、p75 563KB、最大 18MB，也就是说**51.3% 的真原图被当成「没下完」拒掉了**。判据改为相对的（非空、≥1KB、不比压缩版小 10% 以上），并且公开成 `MediaDownloader.original_ready()`，调用方可以用同一条规则。同一个函数的 `timeout` 参数原本是摆设：点完固定 `sleep(3)` 取一次。现在轮询到「可用且大小不再变化」或到 `timeout` 为止；而**本机已经有合格 `_h.dat` 时直接从磁盘解密落盘，一步界面都不碰**。
+  - **档位报告在撒谎，因为查询少了一列**：图片的本地文件名来自正文里的 32 位 hex，而通用的消息 `SELECT` 不带 `packed_info_data`，于是每一行都被判成「不是图片」。新增 `WeChatDB.get_image_rows()`——`local_type=3` 的窄查询，字段名对齐 `get_message_row()`。
+  - **新增 `image_status(user, local_id)` / `list_image_status(user, limit)`**，和 1.2.4.1 的语音报告同一个形状：每条图片报本机有哪几档的字节、最高一档是什么、以及 `reason`（`ok` / `mid_only` / `only_thumbnail` / `original_partial` / `no_local_copy` / `no_md5` / `no_message_row`）；消息表只查一次、附件目录按同一 md5 只扫一次。本机 **211 个会话 4271 条图片**实测：`mid_only` 2210、`only_thumbnail` 1428、`ok` 626、`original_partial` 5、`no_local_copy` 2——**大约 7 条里只有 1 条本机真有原图**，多数反馈是微信的存储策略而不是库坏了，先问一句就省掉一整轮重试。
+  - **真机路线现在会说清是哪一步失败**：预览窗里没有「图片原始大小」按钮（这张本来就是原图／微信没给入口）单独警告并指向 `tier='best'`；目标气泡不在可视区时明确报告而不是瞎猜；可视区里有多张图时，按「这条下面压了几张更新的图」把最可能的气泡排在第一个试，**每点一张都回来核对 md5**，所以点错不可能冒充成功。
+  - **本轮没做真机复验**：点气泡 → 预览窗 → 按钮需要真人客户端和 `rhythm` 闸，因此那一段保持未测；它上面的所有逻辑（档位判据、路由、等待、排序、消息库查询）都有离线回归。
+- **修复：拿不到控件树时一片沉默**（反馈为「控件树被屏蔽」）。`uia_driver` 会把「取不到 `Weixin.dll` 模块」的窗口全部过滤掉，`ensure_materialized()` 遇到空列表直接 `return False`，`ensure_window()` 悄悄改走「设读屏标志 + wake」——**一句日志都不打**。而「窗口全被过滤光」恰恰是 32 位解释器枚举 64 位进程模块的特征（`TH32CS_SNAPMODULE` 从 32 位打 64 位只会得到 `ERROR_PARTIAL_COPY`），用户看不到任何线索，只能说「被屏蔽」。新增 `gate_block_hint(diag, bits=None)`（纯函数，便于离线自检）与 `_warn_gate_blocked()`，分成四种可执行的说法：没扫到可见窗口（没启动／没登录／在托盘）、扫到但模块拿不到（按位数分开：32 位让换 64 位 Python，64 位指向权限与安全软件白名单）、pywin32 缺失，以及**有窗口留下时完全不打扰**。每种原因一个进程只警告一次——长驻监听每轮都会扫，刷屏比不说更糟。过滤逻辑与返回值一字未改，老调用方不受影响。
+- **回归覆盖**：`tools/selftest.py` 新增 `image` 组（39 项，纯离线：临时目录 + 假 db——90% 线的两侧、七种 `reason`、五种 `tier` 路由与文件名、不许悄悄降级、气泡排序、轮询等待、`get_image_rows` 字段对齐、同 md5 不重复扫盘）与 `tree` 组（16 项，假 `win32gui` + 假 pid/模块枚举：计数、四种文案、健康场景零输出、去重、两条真实路径确实都过了诊断）。整套 **282 项 0 失败**。变异验证七刀都会咬：把 `>102400` 绝对门槛放回去 → 5 项红；去掉比例判据 → 2 项红；原图文件名不标 `_h` → 2 项红；排序不看「比这条新几张」→ 3 项红；`tier='original'` 允许悄悄降级 → 1 项红；同一 md5 重复扫盘 → 1 项红；去掉 `ensure_materialized` 的诊断调用 → 2 项红。
 
 ### v1.2.4.1（2026-09-25）
 
@@ -734,6 +746,8 @@ def on_msg(msg, listener):
    模拟右键菜单选择「引用」，依赖微信 4.1.x 自绘渲染布局，随窗口尺寸/DPI/
    会话内容不同可能存在定位偏差，仅建议在测试账号中验证流程。
 8. **语音消息的音频可能不在本地**：微信只有在界面上播放/接收过之后才会把 `voice_data` 写进 `media_*.db`，其余语音 `download_voice()` 只能返回 `None`，而且分不清是「本地没有」还是「库读挂了」。现在 `MediaDownloader.list_voice_status()` / `voice_status()` 会给出原因：`audio_not_downloaded`（本地确实没有，去微信里播放一次即可）与 `audio_missing_from_media_db`（这才值得开 issue）。实测 20 个会话 958 条语音：898 条可取、54 条 `download_status=0` 且确实不在、6 条所在会话在 media 库里没有 Name2Id 索引；`download_status != 0` 与「音频在本地」一一对应，无一例外。
+9. **一条图片在本机最多有三档**：`<md5>_t.dat` 缩略图、`<md5>.dat` 微信默认下发的压缩版、`<md5>_h.dat` **真原图**（只有在微信里点过「查看原图 / 图片原始大小」才会落盘）。取哪一档由 `download_image(user, local_id, tier=...)` 明说：`'original'` 本机没有原图就返回 `None`（**不会悄悄给你压缩版**），`'best'` 原图 > 压缩 > 缩略图，档位写在文件名里（`_h` / 无 / `_thumb`）；不传 `tier` 与旧版逐字一致。想先摸清底细用 `image_status()` / `list_image_status()`，`reason` 取 `ok` / `mid_only` / `only_thumbnail` / `original_partial` / `no_local_copy` / `no_md5` / `no_message_row`。本机 211 个会话 4271 条图片实测：`mid_only` 2210、`only_thumbnail` 1428、`ok` 626、`original_partial` 5、`no_local_copy` 2——**大约 7 条里只有 1 条本机真有原图**，所以「下不到原图」多数是微信的存储策略，不是解密失败；先查状态再决定要不要触发下载，能省掉一整轮无效重试。
+10. **「控件树被屏蔽」现在会给原因**：`mmui` 控件树只有在 `Weixin.dll` 里那个字节被翻开之后才存在，而微信每次重启、升级、重新登录都会把它清 0。库会热写它，但写不成时以前是**静默返回空树**，用户只能描述成「被屏蔽」。现在一个进程只警告一次，并分成四种可执行的说法：没扫到可见窗口（没启动/没登录/在托盘）、扫到但读不到该进程模块（32 位 Python 换 64 位；64 位指向权限与安全软件白名单）、pywin32 缺失，以及窗口正常时**完全不打扰**。
 
 ---
 
@@ -828,7 +842,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.4.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.4.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -977,10 +991,11 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 2. **Image AES key is transient** — only resident while viewing an image; persisted to `image_keys.json` once found, or inject via `image_key=`.
 3. **Sending is a GUI operation** — fails cleanly when the window is locked/unresponsive (operations return a clear failure).
 4. **Videos** are downloadable only when the mp4 already exists on disk (`msg/video/`).
-5. **Group-chat image originals** are stored locally only after being opened (viewed) in WeChat; until then only the thumbnail (`_t.dat`) exists — `download_image` falls back to the thumbnail (marked `_thumb` in the filename).
+5. **A group-chat image exists in up to three tiers** — `<md5>_t.dat` thumbnail, `<md5>.dat` the copy WeChat pushes by default, `<md5>_h.dat` the **real original**, which is only written after the image has been opened with 「查看原图 / 图片原始大小」 in WeChat. Ask before you retry: `MediaDownloader.image_status(user, local_id)` / `list_image_status(user)` report which tiers exist and why (`ok` / `mid_only` / `only_thumbnail` / `original_partial` / …), and `download_image(user, local_id, tier='original'|'best'|'mid'|'thumb')` picks a tier explicitly — `tier='original'` returns `None` instead of quietly handing back the compressed copy, and the tier is written into the filename (`_h` / none / `_thumb`). Not passing `tier` keeps the pre-1.2.4.2 behaviour verbatim. Measured over 4271 image messages in 211 sessions here: 2210 `mid_only`, 1428 `only_thumbnail`, 626 with a real original on disk — roughly **1 in 7**, so "cannot download the original" is usually WeChat's storage policy, not a decryption failure. `download_image_original()` still exists to trigger the fetch through the UI.
 6. **Moments posting is dropped** (4.x self-drawn UI, unreliable); reading/likes/comments are supported.
 7. **Quote-message sending (BETA)** goes through a coordinate + OCR + `SendInput` pipeline that depends on WeChat 4.1.x self-drawn layout; positioning may drift with window size / DPI / chat content — test flow on a throwaway account only.
 8. **Voice messages can be missing their audio locally** — WeChat only writes `voice_data` into `media_*.db` after a voice has been played/received on that machine, so `download_voice()` returns `None` for the rest, with no way to tell "not on disk" from "library broke". `MediaDownloader.list_voice_status()` / `voice_status()` now return the reason: `audio_not_downloaded` (play it once in WeChat) vs `audio_missing_from_media_db` (worth an issue). Measured over 958 voices in 20 sessions: 898 available, 54 flagged `download_status=0` and indeed absent, 6 with no media index entry — `download_status != 0` matched "audio on disk" with no exceptions.
+9. **"The UIA tree is blocked" is usually a readable cause now, not a mystery** — the `mmui` tree only exists after one byte inside `Weixin.dll` is flipped, and that byte resets every time WeChat restarts, updates or you re-login. The library hot-writes it, but when it cannot, it used to return an *empty* tree in silence. It now names the reason once per process (no visible window / window found but its modules unreadable — with 32-bit Python called out separately, since reading a 64-bit process's module list from 32-bit always fails — pywin32 missing), so the fix is obvious instead of guesswork.
 
 ## 🗺️ Roadmap
 
@@ -989,6 +1004,18 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.4.2 (2026-09-30)
+
+- **Fixed: "I can only download the thumbnail, never the original"** (reported with a bot log: 「只要原图，先不用缩略图」 followed by retries that never converged). Three separate causes, none of them decryption:
+  - **`download_image()` never looked at `_h.dat`** — the real original — and when it returned the compressed copy the filename was byte-for-byte the one an original would have (`<user>_<local_id>.jpg`), so a caller that only wants originals could only guess from the file size and retry forever. There is now an explicit `tier=` argument: `'original'` (returns `None` when the machine has no original — it will **not** quietly degrade), `'best'` (original → compressed → thumbnail), `'mid'`, `'thumb'`, and the tier is written into the filename (`_h` / none / `_thumb`). Omitting `tier` reproduces the old behaviour verbatim.
+  - **`download_image_original()` had an absolute size gate, `getsize(_h.dat) > 102400`,** which is how a compressed copy was judged "not downloaded yet". Measured over the 705 `_h.dat` files on this machine: min 575 B, p10 4.3 KB, **p50 91.5 KB**, p75 563 KB, max 18 MB — i.e. **51.3% of real originals were being rejected as incomplete**. The judgement is now relative (non-empty, ≥1 KB, and not more than 10% smaller than the compressed copy), and it is exposed as `MediaDownloader.original_ready()` so callers can apply the same rule. The same function's `timeout` argument was decorative: it clicked and then slept a fixed 3 s, once. It now polls until the file is both usable and no longer growing, or until `timeout` — and if a qualified `_h.dat` already exists, the file is decrypted straight from disk **without touching the UI at all**.
+  - **The tier report was lying because the query was missing a column.** An image's local filename comes from a 32-hex digest inside the message body, and the generic message `SELECT` does not carry `packed_info_data`, so every row came back "not an image". `WeChatDB.get_image_rows()` is a narrow query for `local_type=3` that does, with field names aligned to `get_message_row()`.
+  - **New `image_status(user, local_id)` / `list_image_status(user, limit)`** — same shape as the 1.2.4.1 voice report: per image, the byte size of each tier present, the best tier available, and a `reason` (`ok`, `mid_only`, `only_thumbnail`, `original_partial`, `no_local_copy`, `no_md5`, `no_message_row`), one message-table query and one directory walk per digest. Measured here over **4271 image messages across 211 sessions**: 2210 `mid_only`, 1428 `only_thumbnail`, 626 `ok`, 5 `original_partial`, 2 `no_local_copy` — **about 1 in 7 has an original on disk**, so most of these reports are WeChat's storage policy, not a library bug, and asking first removes the retry storm.
+  - **The UI path is now honest about which step failed**: no 「图片原始大小」 button in the preview window (the image already *is* the original, or WeChat offers no entry) is a distinct warning pointing at `tier='best'`, bubbles that are not in the visible area are reported instead of guessed at, and when several image bubbles are visible the one most likely to be the target is tried first — computed as "how many newer images does this one have below it in the session" — with the digest re-checked after every click, so a wrong bubble cannot pass as the right one.
+  - **Not verified live this round**: the click → preview-window → button path needs the real client and the `rhythm` gate, so it stayed untested; everything above it (tier judgement, routing, waiting, ordering, the DB query) is covered offline.
+- **Fixed: an empty UIA tree was silent** (reported as 「控件树被屏蔽」). `uia_driver` filters out windows whose process has no `Weixin.dll` module, `ensure_materialized()` returned `False` on the empty list, and `ensure_window()` quietly switched to the "set the screen-reader flag and wake" branch — **without logging a single line**. "Every window got filtered out" is precisely the signature of a 32-bit interpreter enumerating a 64-bit process's modules (`TH32CS_SNAPMODULE` returns `ERROR_PARTIAL_COPY`), but the user had no clue and could only say "blocked". Added `gate_block_hint(diag, bits=None)` (pure function, so it is testable offline) and `_warn_gate_blocked()`, which pick from four actionable wordings: no visible window at all (not started / not logged in / minimised to tray), window found but modules unreadable (split by bitness — 32-bit is told to switch to 64-bit Python, 64-bit is pointed at privileges and the security-software allow-list), pywin32 missing, and — when at least one window survives — **no output at all**. Each reason warns once per process, because a long-running listener scans every round and spam is worse than silence. Filtering logic and return values are unchanged, so existing callers are unaffected.
+- **Regression coverage**: `tools/selftest.py` gained an `image` group (39 checks, pure offline: temp attach trees + fake DBs — the 90% boundary on both sides, all seven `reason` values, all five `tier` routes and their filenames, no-silent-degrade, bubble ordering, the poll-until-stable wait, `get_image_rows` column alignment, and the one-walk-per-digest cache) and a `tree` group (16 checks with fake `win32gui` + fake pid/module enumeration: scan counts, four wordings, zero output in the healthy case, de-duplication, and that both real call sites actually consult the diagnostic). Whole suite **282 checks / 0 fail**. Mutations: restoring the `>102400` gate → 5 red; deleting the relative-size rule → 2 red; not marking `_h` in the filename → 2 red; ignoring "how many newer images" when ordering bubbles → 3 red; letting `tier='original'` silently fall back → 1 red; scanning the same digest twice → 1 red; dropping the diagnostic call in `ensure_materialized` → 2 red.
 
 ### v1.2.4.1 (2026-09-25)
 
