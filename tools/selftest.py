@@ -1956,6 +1956,104 @@ def t_image() -> None:
     finally:
         _auto.GetRootControl = _orig_root
 
+    print("[image] 端到端函数体冒烟（假 UIA，不碰真实客户端）")
+    # 这一组存在的理由：以前所有 image 检查都只调辅助函数，download_image_original
+    # 的函数体一次都没执行过，于是一句 `images = [c for ...]`（元素名和循环变量不一致）
+    # 的 NameError 一路活到用户实机才炸。这里把整条控制流走一遍。
+    import wechatauto.guia as _g
+    import wechatauto.uia_driver as _ud
+    import wechatauto.wx as _wxm
+
+    class Ctl:
+        def __init__(self, top):
+            self.BoundingRectangle = R(466, top, 3064, top + 246)
+
+    class FakeLst:
+        def __init__(self):
+            self.BoundingRectangle = R(466, 160, 3064, 1370)
+
+        def GetChildren(self):
+            return []
+
+    class FakeUIA:
+        def __init__(self, *a, **k):
+            pass
+
+        def ensure_window(self):
+            return True
+
+        def _message_list(self):
+            return FakeLst()
+
+        def _force_foreground(self, hwnd):
+            return True
+
+    class FakeGui:
+        main_hwnd, pid = 1234, 4321
+
+    class FakeWX:
+        def __init__(self, *a, **k):
+            self._gui = FakeGui()
+
+        def ChatWith(self, who):
+            return True
+
+    clicks = []
+
+    class FakeInput:
+        def real_click(self, x, y):
+            clicks.append((x, y))
+
+    class FakePreview:
+        ClassName = "mmui::PreviewWindow"
+        NativeWindowHandle = 99
+
+        def __init__(self):
+            self.BoundingRectangle = R(700, 40, 2300, 1700)
+
+    class RowDB:
+        def __init__(self, sender):
+            self.sender = sender
+
+        def get_message_row(self, u, lid, local_type=None):
+            return {"local_type": 3, "create_time": 1, "sort_seq": 50,
+                    "sender_id": self.sender, "packed_info": MD5.encode(),
+                    "content": b""}
+
+        def get_messages(self, user, limit=20, offset=0):
+            return []
+
+    def smoke(sender):
+        ms = MediaDownloader.__new__(MediaDownloader)
+        ms.save_dir = tempfile.mkdtemp(prefix='wxsmoke-')
+        tmpdirs.append(ms.save_dir)
+        ms.db = RowDB(sender)
+        ms._image_files = lambda u, m: {}          # 本机没有原图 → 必须走界面
+        ms._visible_rows = lambda lst: [("image", "图片", Ctl(700)),
+                                        ("text", "正文一行", Ctl(950))]
+        ms._locate_image_row = lambda lid, lst, dbs, uia, h, p, dl, max_scrolls=6: \
+            (ms._visible_rows(lst)[0][2], "aligned")
+        ms._preview_windows = lambda: [(99, FakePreview())]
+        ms._find_preview_button = lambda w, name: None   # 预览窗里没这个按钮
+        ua, wxm, gu = _ud.WeChatUIA, _wxm.WeChat, _g.WinInput
+        _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = FakeUIA, FakeWX, FakeInput
+        try:
+            out = ms.download_image_original("wxid_img", 7, timeout=3.0,
+                                             chat_name="显示名")
+        finally:
+            _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = ua, wxm, gu
+        return out
+
+    clicks.clear()
+    check("函数体能走完（没走到就报 NameError/AttributeError）", smoke(None) is None)
+    check("走到了点击那一步（不是提前 return）", len(clicks) >= 1, str(clicks))
+    check("别人发的：先点左边 x=777", clicks and clicks[0][0] == 777, str(clicks[:2]))
+    clicks.clear()
+    smoke(2)
+    check("自己发的（sender_id==2）：先点右边 x=2753",
+          clicks and clicks[0][0] == 2753, str(clicks[:2]))
+    check("行中心取的是那一行的中线", clicks and clicks[0][1] == 700 + 123, str(clicks[:1]))
+
     for p in tmpdirs:
         shutil.rmtree(p, ignore_errors=True)
 

@@ -1402,7 +1402,7 @@ class MediaDownloader:
                     wxlog.debug("定位图片行抛错（%s），退回按图片计数", type(e).__name__)
                     note = "error"
             ui = self._visible_rows(lst)     # 滚过一轮之后可视区已经变了，重读
-            images = [c for k, _n, _c in ui if k == "image"]
+            images = [_c for k, _n, _c in ui if k == "image"]
             wxlog.debug("可视消息行 %d 行（图片行 %d 行）定位结果=%s ChatWith=%s",
                         len(ui), len(images), note, opened)
             if not images:
