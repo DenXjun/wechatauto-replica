@@ -507,6 +507,12 @@ class MediaDownloader:
     # ------------------------------------------------------------------
     IMAGE_TIERS = ("original", "mid", "thumb")
 
+    # 预览窗里那颗缩放切换键的两个状态名（同一颗按钮，Name 随显示状态变）：
+    #   「图片原始大小」  = 当前是缩放显示，点它会去要/显示原件（可能触发下载）
+    #   「图片适应窗口大小」= 原件已经在显示中，点它只会缩回去，不该点
+    ZOOM_REQUEST = "图片原始大小"
+    ZOOM_SHOWN = "图片适应窗口大小"
+
     def _image_files(self, user: str, md5: str) -> dict:
         """这条图片在本机有哪几档副本：``{tier: (path, bytes)}``，缺的档不出现。
 
@@ -1491,12 +1497,15 @@ class MediaDownloader:
 
     @staticmethod
     def _find_preview_button(ctrl, name, max_depth=8):
-        """在 PreviewWindow 中递归查找指定名称的按钮。"""
+        """在预览窗里按 Name 找按钮。``name`` 可以是字符串，也可以是**候选名元组**
+        ——那颗缩放键的 Name 会随显示状态在「图片原始大小」/「图片适应窗口大小」之间
+        切换，只写死一个就会有一半时间找不到。"""
         if max_depth <= 0:
             return None
+        names = (name,) if isinstance(name, str) else tuple(name or ())
         for kid in ctrl.GetChildren():
             try:
-                if kid.Name == name:
+                if (kid.Name or "").strip() in names:
                     return kid
                 found = MediaDownloader._find_preview_button(kid, name, max_depth - 1)
                 if found:
@@ -1731,7 +1740,8 @@ class MediaDownloader:
                         fresh = [(h, w) for h, w in self._preview_windows()
                                  if h not in before]
                         for _h, w in fresh:
-                            b = self._find_preview_button(w, "图片原始大小")
+                            b = self._find_preview_button(
+                                w, (self.ZOOM_REQUEST, self.ZOOM_SHOWN))
                             if b is not None:
                                 preview_win, btn = w, b
                                 break
@@ -1748,21 +1758,19 @@ class MediaDownloader:
                 if preview_win is None:
                     wxlog.debug("点击后没出现新的预览窗（点偏了 / 点的不是这张图），换下一个气泡")
                     continue
-                if btn is None:
-                    wxlog.warning(
-                        "预览窗里没有「图片原始大小」按钮：这条图本机已是最大一档，"
-                        "微信没有更大的原件可下载（要真原图只能让对方重发原图）。"
-                        "想要「本机最好的那份」请用 download_image(tier='best')。"
-                        " user=%s local_id=%s", user, local_id)
-                    return None
-
-                # 按钮是完整 UIA 控件，用 UIA 原生 Click（不依赖全局 SetCursorPos 坐标映射）
-                try:
-                    btn.Click()
-                except Exception:
-                    btn_r = btn.BoundingRectangle
-                    inp.real_click(int((btn_r.left + btn_r.right) / 2),
-                                   int((btn_r.top + btn_r.bottom) / 2))
+                # 缩放键只在「当前是适应窗口、点一下要看原始大小」时才有意义；
+                # Name 已经是「图片适应窗口大小」说明原件就在显示中，再点只会缩回去。
+                zoom_name = (btn.Name or "").strip() if btn is not None else ""
+                if zoom_name == self.ZOOM_REQUEST:
+                    try:
+                        btn.Click()
+                    except Exception:
+                        btn_r = btn.BoundingRectangle
+                        inp.real_click(int((btn_r.left + btn_r.right) / 2),
+                                       int((btn_r.top + btn_r.bottom) / 2))
+                else:
+                    wxlog.debug("预览窗缩放键状态=%r（不是「%s」），不点它，直接走「保存」",
+                                zoom_name or "没有这颗按钮", self.ZOOM_REQUEST)
 
                 got = self._wait_h_dat(user, md5, min_bytes,
                                         min(deadline, time.time() + max(5.0, timeout / 3.0)))

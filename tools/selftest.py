@@ -1992,13 +1992,17 @@ def t_image() -> None:
     ms.save_dir = tempfile.mkdtemp(prefix='wxout2-')
     tmpdirs.append(ms.save_dir)
     ms._find_preview_button = lambda w, name: (
-        SaveBtn(new_jpg) if name == "保存" else None)
+        SaveBtn(os.path.join(sub, "wx_saved.jpg")) if name == "保存" else None)
     ms._save_dialog = staticmethod(lambda: None)
     got = ms._save_via_button(Win(), ms.save_dir, "wxid_img_7",
                               _time.time() + 20, _time.time())
     check("点「保存」后扫到新文件 → 收进 save_dir 并返回路径",
           got and got.endswith("wxid_img_7.jpg") and _os.path.isfile(got)
           and _os.path.getsize(got) == len(JPG), str(got))
+    # 反向确认：同一份快照之间没有新东西，就不会误报「拿到了文件」
+    same = mv._recent_images(acc, _time.time() - 60)
+    check("同一份快照自比不产生新文件（不会把「没有」读成「拿到了」）",
+          MediaDownloader._new_images(same, mv._recent_images(acc, _time.time() - 60)) == [])
     ms2 = MediaDownloader.__new__(MediaDownloader)
     ms2.db = AccDB()
     ms2.save_dir = ms.save_dir
@@ -2044,6 +2048,21 @@ def t_image() -> None:
 
         def GetChildren(self):
             return self._k
+
+    class BtnNode(Node):
+        ClassName = "mmui::XButton"
+
+        def __init__(self, name):
+            self.Name = name
+
+    zoom_tree = Dlg([Dlg([BtnNode("图片适应窗口大小")])])
+    check("按候选名找按钮：状态名换了也找得到（实机就撞见过另一颗名字）",
+          MediaDownloader._find_preview_button(
+              zoom_tree, (MediaDownloader.ZOOM_REQUEST,
+                          MediaDownloader.ZOOM_SHOWN)).Name == "图片适应窗口大小")
+    check("只给老名字「图片原始大小」时找不到（这正是提前返回、兜底跑不到的原因）",
+          MediaDownloader._find_preview_button(
+              zoom_tree, MediaDownloader.ZOOM_REQUEST) is None)
 
     ed, bt = Edit(), DlgBtn("保存(S)")
     dlg = Dlg([Dlg([ed]), Dlg([bt])])
@@ -2247,16 +2266,19 @@ def t_image() -> None:
     plans = []
 
     class FakeBtn:
-        Name = "图片原始大小"
-
-        def __init__(self):
+        def __init__(self, name="图片原始大小"):
+            self.Name = name
             self.BoundingRectangle = R(466, 74, 522, 130)
             self.clicked = 0
 
         def Click(self):
             self.clicked += 1
 
-    def smoke(sender, pid_ok=True, has_button=True, chat=None, pre_open=False):
+    saved_calls = []
+
+    def smoke(sender, pid_ok=True, has_button=True, chat=None, pre_open=False,
+              zoom="request", h_dat=True, save_returns=None):
+        """zoom: request=「图片原始大小」/ shown=「图片适应窗口大小」/ none=找不到那颗键"""
         FakeGui.pid = 4321 if pid_ok else None
         FakeUIA.no_hwnd = not pid_ok
         FakeUIA.chat = chat
@@ -2267,7 +2289,22 @@ def t_image() -> None:
         ms._image_files = lambda u, m: {}          # 本机没有原图 → 必须走界面
         ms._visible_rows = lambda lst: [("image", "图片", Ctl(700)),
                                         ("text", "正文一行", Ctl(950))]
-        btn = FakeBtn()
+        zoom_btn = FakeBtn({"request": "图片原始大小",
+                            "shown": "图片适应窗口大小"}.get(zoom, "")) \
+            if zoom != "none" else None
+
+        def _find(_w, name):
+            names = (name,) if isinstance(name, str) else tuple(name or ())
+            if MediaDownloader.ZOOM_REQUEST in names or \
+                    MediaDownloader.ZOOM_SHOWN in names:
+                return zoom_btn
+            return FakeBtn("保存") if has_button else None
+        ms._find_preview_button = _find
+
+        def _save(win, save_dir, stem, deadline, t0):
+            saved_calls.append(stem)
+            return save_returns
+        ms._save_via_button = _save
 
         def _loc(lid, lst, dbs, uia, h, p, dl, max_scrolls=6):
             plans.append(max_scrolls)
@@ -2277,9 +2314,8 @@ def t_image() -> None:
         # pre_open=True 模拟「本来就开着一张大图」——那种窗不能当成果。
         ms._preview_windows = lambda: ([(99, FakePreview())]
                                        if (pre_open or clicks) else [])
-        ms._find_preview_button = lambda w, name: (btn if has_button else None)
-        ms._wait_h_dat = lambda u, m, mid_sz=0, min_bytes=1024, until=None: (
-            "C:\\tmp\\x_h.dat", 5000)             # 点完按钮 → 原图落盘
+        ms._wait_h_dat = lambda u, m, min_bytes=1024, until=None: (
+            ("C:\\tmp\\x_h.dat", 5000) if h_dat else None)
         ms._find_h_dat = lambda u, m: "C:\\tmp\\x_h.dat"
         ms.decrypt_image = lambda p, a=None, x=None: JPEG
         ua, wxm, gu = _ud.WeChatUIA, _wxm.WeChat, _g.WinInput
@@ -2291,7 +2327,7 @@ def t_image() -> None:
             _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = ua, wxm, gu
             FakeUIA.no_hwnd = False
             FakeGui.pid = 4321
-        return out, btn
+        return out, zoom_btn
 
     clicks.clear()
     chatwith.clear()
@@ -2302,7 +2338,8 @@ def t_image() -> None:
           str(out0))
     check("走到了点击那一步（不是提前 return）", len(clicks) >= 1, str(clicks))
     check("别人发的：先点左边 x=777", clicks and clicks[0][0] == 777, str(clicks[:2]))
-    check("找到按钮后按 UIA 名字点它，不按比例猜坐标", btn0.clicked == 1, str(btn0.clicked))
+    check("缩放键处于「图片原始大小」状态时才点它（按名字点，不按比例猜）",
+          btn0.clicked == 1, str(btn0.clicked))
     check("已经在目标会话里 → 不再搜索进入（批量下载多张图时不反复搜）",
           chatwith == [], str(chatwith))
     check("拿得到微信进程 id 时才允许滚界面（传进去的 max_scrolls 非 0）",
@@ -2324,11 +2361,33 @@ def t_image() -> None:
     check("拿不到进程 id → 绝不滚界面（max_scrolls=0，落点无法校验）",
           plans and plans[-1] == 0, str(plans))
     clicks.clear()
-    check("预览窗里没有「图片原始大小」按钮时明确失败并返回 None",
-          smoke(None, chat="显示名", has_button=False)[0] is None)
+    check("缩放键和「保存」都拿不到东西时才失败（返回 None）",
+          smoke(None, chat="显示名", has_button=False, h_dat=False)[0] is None)
     clicks.clear()
     check("屏上本来就开着预览窗时不算「点开成功」（只认新出现的窗口）",
           smoke(None, chat="显示名", pre_open=True)[0] is None)
+    # 那颗键的 Name 会随显示状态在两个值之间切（实机就撞见过「图片适应窗口大小」），
+    # 只写死一个名字 → 找不到就提前返回，「保存」那条兜底根本没机会跑。
+    saved_calls.clear()
+    clicks.clear()
+    out_z, btn_z = smoke(None, chat="显示名", zoom="shown", h_dat=False,
+                         save_returns=r"C:\tmp\saved.jpg")
+    check("缩放键已是「图片适应窗口大小」→ 不点它（点了只会缩回去），直接走保存",
+          btn_z.clicked == 0 and saved_calls == ["wxid_img_7"],
+          "%s %s" % (btn_z.clicked, saved_calls))
+    check("「保存」拿到的文件原样返回", out_z == r"C:\tmp\saved.jpg", str(out_z))
+    saved_calls.clear()
+    clicks.clear()
+    out_n2, _b2 = smoke(None, chat="显示名", zoom="none", h_dat=False,
+                        save_returns=r"C:\tmp\s2.jpg")
+    check("找不到缩放键时不再提前返回，仍然继续走「保存」",
+          saved_calls == ["wxid_img_7"] and out_n2 == r"C:\tmp\s2.jpg",
+          "%s %s" % (saved_calls, out_n2))
+    saved_calls.clear()
+    clicks.clear()
+    check("缩放键找不到、保存也没东西 → 最终失败返回 None",
+          smoke(None, chat="显示名", zoom="none", h_dat=False)[0] is None
+          and saved_calls == ["wxid_img_7"], str(saved_calls))
     # 主窗停在朋友圈页：RecyclerListView 真的不在树里，以前只警告一句就返回，
     # 看起来就是「UIA 没有任何操作」。现在先点回「微信」标签再重新进会话。
     FakeUIA.hide_list, FakeUIA.recovered = 1, 0
