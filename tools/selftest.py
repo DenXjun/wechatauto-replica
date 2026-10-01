@@ -2549,11 +2549,13 @@ def t_image() -> None:
         no_hwnd = False
         hide_list = 0            # >0：前 N 次 _message_list 返回 None（模拟停在朋友圈页）
         recovered = 0
+        entered = 0              # 进过几次界面这条路（本机已有原件时应该是 0）
 
         def __init__(self, *a, **k):
             pass
 
         def ensure_window(self):
+            FakeUIA.entered += 1
             return True
 
         def current_chat(self):
@@ -2654,6 +2656,7 @@ def t_image() -> None:
         FakeGui.pid = 4321 if pid_ok else None
         FakeUIA.no_hwnd = not pid_ok
         FakeUIA.chat = chat
+        FakeUIA.entered = 0
         ms = MediaDownloader.__new__(MediaDownloader)
         ms.save_dir = tempfile.mkdtemp(prefix='wxsmoke-')
         tmpdirs.append(ms.save_dir)
@@ -2791,8 +2794,9 @@ def t_image() -> None:
     clicks.clear()
     chatwith.clear()
     out_h, _b3 = smoke(None, chat="显示名", tiers="h")
-    check("本机已有合格 _h.dat → 不碰界面，直接解密落盘",
-          out_h is not None and not clicks and not chatwith, "%s %s" % (out_h, clicks))
+    check("本机已有合格 _h.dat → 连界面这条路都不进（不构造 UIA、不 ensure_window）",
+          out_h is not None and not clicks and not chatwith and not FakeUIA.entered,
+          "%s 点击=%s 进了界面 %d 次" % (out_h, clicks, FakeUIA.entered))
 
     # 点界面那一段：缩放键该点就点（那颗键才会去追原件），解密的是 _wait_tier 交回来的路径
     clicks.clear()
