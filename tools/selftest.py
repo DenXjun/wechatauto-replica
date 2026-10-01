@@ -1767,6 +1767,43 @@ def t_image() -> None:
     check("乱序传入也按 top 排", ob(list(reversed(pairs)), 0)[0] == 'd')
     check("空列表不抛", ob([], 0) == [])
 
+    print("[image] 气泡在哪一侧的哪个 x：竖屏（portrait）实测点不中的根因")
+    # PrintWindow 拍微信窗口本体量到的两组数（屏幕截图不可信——会拍到压在微信上面的
+    # IDE 面板）：行矩形都是整行宽，但气泡位置不随行宽等比缩放。
+    #   宽窗口 行 466..3064（2598 宽）→ 气泡 +44..+632
+    #   竖屏   行 414..1134（ 720 宽）→ 气泡 +141..+459（自发图镜像 +261..+579）
+    from types import SimpleNamespace as _R
+    bx = MediaDownloader._bubble_click_xs
+    wide, port = _R(left=466, right=3064), _R(left=414, right=1134)
+    check("宽窗口：别人发的第一个候选还是 x=777（旧行为逐字不变）",
+          bx(wide, False)[0] == 777, str(bx(wide, False)[:2]))
+    check("宽窗口：自己发的第一个候选还是 x=2753",
+          bx(wide, True)[0] == 2753, str(bx(wide, True)[:2]))
+    check("宽窗口两种口径算出同一个点 → 候选不重复",
+          len(set(bx(wide, False))) == 2, str(bx(wide, False)))
+    band = (141, 459)
+    check("竖屏：第一个候选落在实测气泡区间 +141..+459 里",
+          band[0] <= bx(port, False)[0] - port.left <= band[1],
+          "候选 +%d" % (bx(port, False)[0] - port.left))
+    check("竖屏：旧的「行宽 12%」=+86 在区间之外（这就是点不中的原因）",
+          not (band[0] <= int((port.right - port.left) * 0.12) <= band[1]),
+          "12%% = +%d" % int((port.right - port.left) * 0.12))
+    mband = (261, 579)
+    check("竖屏自发图（镜像区间）：第一个候选落在 +261..+579 里",
+          mband[0] <= port.right - bx(port, True)[0] <= mband[1] or
+          mband[0] <= bx(port, True)[0] - port.left <= mband[1],
+          "候选距右边缘 %d" % (port.right - bx(port, True)[0]))
+    check("候选全部落在行内（不会点到消息带外面）",
+          all(port.left < x < port.right for x in bx(port, False)) and
+          all(port.left < x < port.right for x in bx(port, True)),
+          str(bx(port, False)))
+    tiny = _R(left=0, right=300)
+    check("极窄行（300 宽）也不越界", all(0 < x < 300 for x in bx(tiny, False)),
+          str(bx(tiny, False)))
+    check("候选按发送方先排：自己发的先给右侧，别人发的先给左侧",
+          bx(port, True)[0] > bx(port, False)[0],
+          "%s vs %s" % (bx(port, True)[0], bx(port, False)[0]))
+
     class RowsDB:
         def __init__(self, rows, boom=False):
             self.rows, self.boom = rows, boom

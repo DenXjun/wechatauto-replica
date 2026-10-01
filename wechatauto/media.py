@@ -752,18 +752,40 @@ class MediaDownloader:
         notches = min(int(max_notches), max(1, int(abs(int(delta_rows)) / per + 0.999)))
         return (-120 if delta_rows > 0 else 120, notches)
 
-    @staticmethod
-    def _bubble_click_xs(rect, is_self) -> list:
-        """缩略图在这一行里的可点 x，先按发送方那一侧，再试另一侧。
+    # 气泡离「发送方那一侧边缘」的绝对锚点（物理像素）。
+    # 为什么用绝对值而不是百分比：气泡的位置**不随行宽等比缩放**——头像列加边距是
+    # 固定像素，气泡本身也有个上限宽度。实测两种布局：
+    #   宽窗口 行宽 2598 → 气泡在左边缘 +44~+632（+1.7%~+24.3%）
+    #   竖屏   行宽  720 → 气泡在左边缘 +141~+459（+19.6%~+63.8%）
+    # 「行宽的 12%」在前者是 311px（命中），在后者只有 86px（落在底色上，点不中）。
+    # 300px 这个锚点在两种布局里都落在气泡内（竖屏 300∈[141,459]，宽窗 300∈[44,632]）。
+    BUBBLE_ANCHOR_PX = 300
 
-        行矩形是**整行宽**（实测 2598px），缩略图只占其中一小块：200% 缩放下内容带
-        在左边缘 +1.7%~+24.3%（绝对 x=510~1098），所以 12% 落在带内。但**自己发的
-        图气泡在右边**，只按左边点就会点空——这是「点击打开图片时错位」最直接的一种
-        形状，所以两侧都给，先给该中的那侧。
+    @classmethod
+    def _bubble_click_xs(cls, rect, is_self) -> list:
+        """缩略图在这一行里的可点 x：先发送方那一侧，再试另一侧。
+
+        行矩形是**整行宽**，气泡只占其中一块，而且这块位置不随行宽等比缩放
+        （见 :attr:`BUBBLE_ANCHOR_PX` 上面那两组实测数）。所以候选按「绝对锚点 →
+        旧的行宽 12%」排，两侧各给一次：宽窗口里两个数算出同一个 x（311 与 300 取
+        大 = 311），行为和以前逐字一致；竖屏里绝对锚点先命中，12% 那个只是后备。
+        每个候选都有「有没有新弹出预览窗」这个可观察事件兜着，点空不算成功，
+        也不可能点到别的行（y 一直是这一行的中线）。
         """
-        off = int((rect.right - rect.left) * 0.12)
-        left, right = rect.left + off, rect.right - off
-        return [right, left] if is_self else [left, right]
+        w = int(rect.right) - int(rect.left)
+        pct = int(w * 0.12)
+        anchor = min(max(cls.BUBBLE_ANCHOR_PX, pct), int(w * 0.45))
+        if is_self:
+            cands = [int(rect.right) - anchor, int(rect.right) - pct,
+                     int(rect.left) + anchor, int(rect.left) + pct]
+        else:
+            cands = [int(rect.left) + anchor, int(rect.left) + pct,
+                     int(rect.right) - anchor, int(rect.right) - pct]
+        xs = []
+        for x in cands:
+            if x not in xs:
+                xs.append(x)
+        return xs
 
     def _sent_by_self(self, row) -> bool:
         """这条消息是不是本机账号自己发的。
