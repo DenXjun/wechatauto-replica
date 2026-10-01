@@ -1435,13 +1435,14 @@ class MediaDownloader:
         for n in range(1, max(1, int(attempts)) + 1):
             size = self._save_once(win, target, deadline, t0)
             if size is None:
-                return target if best else None
+                return self._restore_best(target, best)
             if size > best:
                 best = size
+                self._stash_best(target)
             if not self._looks_preview(size, ref_thumb, ref_mid):
                 wxlog.info("已用预览窗「保存」拿到明文图：%s（%d KB）",
                            os.path.basename(target), size // 1024)
-                return target
+                return self._restore_best(target, best)
             if n < max(1, int(attempts)):
                 wxlog.info("第 %d 次「保存」写出的还是预览图那份（%d KB，本机完整图是 %s KB），"
                            "点「图片原始大小」再存一次", n, size // 1024,
@@ -1451,6 +1452,43 @@ class MediaDownloader:
         wxlog.warning("点了 %d 次「保存」，写出来的仍是预览图那份（%d KB）——"
                       "这张在微信侧最多就是这个尺寸，要真原件只能让对方重发原图",
                       max(1, int(attempts)), best // 1024)
+        return self._restore_best(target, best)
+
+    @staticmethod
+    def _stash_best(target):
+        """把当前这份留一份副本（``.best``），用来在"后一遍反而更小"时换回去。"""
+        try:
+            with open(target, "rb") as s:
+                data = s.read()
+            with open(target + ".best", "wb") as d:
+                d.write(data)
+        except OSError as e:
+            wxlog.debug("留保存产物副本失败：%s", e)
+
+    @staticmethod
+    def _restore_best(target, best):
+        """几遍里最大那份才是能给的那份：最后一遍可能反而更小，这时把留的那份换回去。
+
+        不这么做的话「两遍取大的」只是句空话——``target`` 里躺的是最后一遍写的那一幅。
+        """
+        keep = target + ".best"
+        try:
+            if best and os.path.isfile(keep) and (
+                    not os.path.isfile(target) or os.path.getsize(target) < best):
+                with open(keep, "rb") as s:
+                    data = s.read()
+                with open(target, "wb") as d:
+                    d.write(data)
+                wxlog.debug("后一遍「保存」写出的更小，换回最大的那份（%d KB）",
+                            len(data) // 1024)
+        except OSError as e:
+            wxlog.debug("换回最大那份失败：%s", e)
+        finally:
+            try:
+                if os.path.isfile(keep):
+                    os.remove(keep)
+            except OSError:
+                pass
         return target if best else None
 
     def _save_once(self, win, target, deadline, t0):

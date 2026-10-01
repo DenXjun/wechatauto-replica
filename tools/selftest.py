@@ -2434,6 +2434,16 @@ def t_image() -> None:
     check("两遍都还是预览图 → 也把本机最好的那份交出去（并说明只能让对方重发原图）",
           got8 is not None and len(calls6) == 2, "%s %d" % (got8, len(calls6)))
     calls6[:] = []
+    seq6[:] = [18000, 5000]
+    got_b = ms6._save_via_button(Win(), ms6.save_dir, "again", _time.time() + 25,
+                                 _time.time(), ref_thumb=17000, ref_mid=95000)
+    check("第二遍反而更小 → 交的仍是几遍里最大的那份（不是最后一遍那幅）",
+          got_b is not None and len(calls6) == 2 and _os.path.getsize(got_b) == 18000,
+          "%s %s 大小=%s" % (got_b, len(calls6),
+                             _os.path.getsize(got_b) if got_b else "-"))
+    check("留的副本用完就删掉（不在用户目录里留 .best 垃圾）",
+          not _os.path.isfile(got_b + ".best") if got_b else True)
+    calls6[:] = []
     seq6[:] = [None]
     got9 = ms6._save_via_button(Win(), ms6.save_dir, "gone", _time.time() + 25,
                                 _time.time(), ref_thumb=17000, ref_mid=95000)
