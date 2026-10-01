@@ -1462,6 +1462,86 @@ def t_tree() -> None:
     check("ensure_materialized 的早退分支也带诊断",
           "_warn_gate_blocked" in seg2 and "self._wechat_hwnds(scan)" in seg2)
 
+    print("[tree] 窄窗口里点一次退不出会话：按「聊天页那一片出来没有」决定点几下")
+    # 用户实测（主窗 848×1274、开着会话）：点第一下导航栏「微信」只把主窗带回聊天页，
+    # 会话还开着，session_list 和搜索框都**不在树里**；要再点一次才退出会话。
+    # 以前无条件只点一下，于是 open_chat 接下来找搜索框必然落空——报出来就是「会话打不开」。
+    class N:
+        def __init__(self, cls="", aid="", ctype="", name="", kids=None):
+            self.ClassName, self.AutomationId = cls, aid
+            self.ControlTypeName, self.Name = ctype, name
+            self._kids = kids or []
+
+        def GetChildren(self):
+            return list(self._kids)
+
+    o_rhythm, o_log = ud.rhythm, ud.wxlog
+    warns = []
+    ud.wxlog = types.SimpleNamespace(
+        debug=lambda *a: None, info=lambda *a: None,
+        warning=lambda f, *a: warns.append(f % a if a else f))
+    try:
+        ud.rhythm = types.SimpleNamespace(nap=lambda s=0.0: None)
+
+        def mk(kids=(), bar=True, msg=True):
+            tab = N(cls=ud.TAB_ITEM_CLS, name=ud.CHAT_TAB_NAME)
+            bar_c = N(cls=ud.MAIN_TAB_BAR_CLS, kids=[tab]) if bar else None
+            # msg=True：窄窗口开着会话时消息列表**本来就在树里**（实测
+            # chat_message_list rect=(776,486,1496,1312)），所以它不能当判据。
+            kids = list(kids)
+            if msg:
+                kids.append(N(cls="mmui::RecyclerListView", aid="chat_message_list"))
+            content = N(cls="mmui::MainView", kids=kids)
+            root = N(cls="mmui::MainWindow",
+                     kids=[c for c in (bar_c, content) if c is not None])
+            return root, content
+
+        def run(root, content, flip_after=None, **kw):
+            """flip_after：第几次点击之后才让 session_list 出现（None=一直不出现）。"""
+            clicks = []
+
+            def _click(_c):
+                clicks.append(1)
+                if flip_after is not None and len(clicks) >= flip_after:
+                    content._kids.append(N(aid="session_list"))
+                return True
+            uu = WeChatUIA.__new__(WeChatUIA)
+            uu._win, uu._click_ctrl = root, _click
+            uu._find_main = lambda: root
+            return uu.back_to_chat_tab(settle=0.0, **kw), len(clicks)
+
+        ok, n = run(*mk([N(aid="session_list")]))
+        check("会话列表本来就在 → 一点都不点（旧写法会先无条件点一下，把用户开着的会话切走）",
+              ok is True and n == 0, "点了 %d 次" % n)
+        ok, n = run(*mk([N(ctype="EditControl", name=ud.SEARCH_EDIT_NAME)]))
+        check("只有搜索框在树里也算回到聊天页（open_chat 要的就是搜索框）",
+              ok is True and n == 0, "点了 %d 次" % n)
+        ok, n = run(*mk([]), flip_after=2)
+        check("窄窗口开着会话：点一次没退出 → 再点一次（用户要的就是这第二下）",
+              ok is True and n == 2, "%s 点了 %d 次" % (ok, n))
+        ok, n = run(*mk([]), flip_after=1)
+        check("点一次就退出时不多点第二下（多那一下会把会话切走）",
+              ok is True and n == 1, "%s 点了 %d 次" % (ok, n))
+        ok, n = run(*mk([]), flip_after=None)
+        check("点满还没出来 → 明确 False 并警告卡在哪（不静默）",
+              ok is False and n == 2 and any("不在树里" in w for w in warns),
+              "%s 点了 %d 次 警告=%d" % (ok, n, len(warns)))
+        warns[:] = []
+        ok, n = run(*mk([]), flip_after=2, max_clicks=1)
+        check("max_clicks=1 时只点一次就收手（调用方能自己限额度）",
+              ok is False and n == 1, "%s 点了 %d 次" % (ok, n))
+        ok, n = run(*mk([N(ctype="EditControl", name=ud.SEARCH_EDIT_NAME)]),
+                    flip_after=None, require_list=True)
+        check("require_list=True 时搜索框不算数（真要会话列表的调用方不被骗）",
+              ok is False and n == 2, "%s 点了 %d 次" % (ok, n))
+        ok, n = run(*mk([], bar=False))
+        check("导航栏都找不到 → False 并且一次都不点",
+              ok is False and n == 0, "%s 点了 %d 次" % (ok, n))
+    finally:
+        ud.rhythm, ud.wxlog = o_rhythm, o_log
+    check("rhythm 与 wxlog 已还原",
+          ud.rhythm is o_rhythm and ud.wxlog is o_log)
+
 
 # ----------------------------------------------------------------------
 # 14. 图片三档（_h.dat 原图 / .dat 压缩 / _t.dat 缩略图）——纯离线，临时目录 + 假 db

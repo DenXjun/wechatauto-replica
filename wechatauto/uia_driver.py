@@ -1411,19 +1411,43 @@ class WeChatUIA:
             pass
         return candidates
 
-    def back_to_chat_tab(self, settle: float = 1.0) -> bool:
+    @staticmethod
+    def _chat_page_ready(win) -> bool:
+        """聊天页那一片「看得见」没有：会话列表或搜索框任一在树里就算看得见。
+
+        只认这两样，不认消息列表——窄窗口里开着会话时消息列表本来就在。
+        实测（主窗 848×1274、开着会话）：``session_list`` 与搜索框**整片不在树里**，
+        而导航栏 4 颗 tab 的 ``IsSelected``/``SelectionItemPattern`` 一个都读不出来，
+        所以判「有没有回到会话列表」只能靠这两样，不能靠 tab 的选中态。
+        """
+        if win is None:
+            return False
+        return (_find_by(win, lambda c: _aid_hit(getattr(c, "AutomationId", ""),
+                                                 SESSION_LIST_AIDS), max_depth=30)
+                is not None
+                or _find_by(win, lambda c: (c.ControlTypeName == "EditControl"
+                                            and SEARCH_EDIT_NAME in (c.Name or "")),
+                            max_depth=30) is not None)
+
+    def back_to_chat_tab(self, settle: float = 1.0, max_clicks: int = 2,
+                         require_list: bool = False) -> bool:
         """点导航栏第一个 tab（「微信」栏），把主窗带回聊天页。
 
         朋友圈相关接口（``WeChat.SwitchToMoments``）会把主窗留在朋友圈页，那里
         会话列表和消息列表都不渲染，之后一切按搜索框/消息列表走的操作静默失败
         （实测只剩一句 ``message_list is None``）。
 
-        这里**不做判页**：4.1.13 实测各页控件在 UIA 树里常驻——切到通讯录/收藏/
-        发现以后，``ChatSessionList``、``RecyclerListView``、搜索框照样报
-        ``offscreen=False``、rect 一个像素都不变，树根本读不出当前是哪一页。
-        所以只能无条件点一下：点已经选中的 tab 无害（顶多把会话列表滚回顶部）。
-        tab 名匹配不上（改版/语言包）就按导航栏第一个 item 兜底，顺序固定微信
-        在最前。找不到 MainTabBar 返回 False，不抛。
+        这里**不按控件判页**（切到通讯录/收藏/发现以后，会话列表、消息列表、搜索框
+        照样报 ``offscreen=False``、rect 一个像素都不变，树读不出当前是哪一页），
+        但**要按「聊天页那一片有没有渲染出来」再决定点不点第二下**：窄窗口（实测
+        848px 宽）里开着会话时，点第一下「微信」只把主窗带回聊天页，**当前会话还开着**，
+        ``session_list`` 和搜索框仍然不在树里——用户实测要再点一次才退出会话。
+        只点一下的旧写法会让下一步的搜索框查找直接失败，看起来就是「会话打不开」。
+        所以改成：点一下 → 等 ``settle`` → 看聊天页那一片出来没有 → 没出来且还有额度
+        就再点一次。已经出来就**不再多点**（那一下会把用户正在看的会话切掉）。
+        ``require_list=True`` 时判据更严：只认 ``session_list``（调用方真的要会话列表，
+        而不只是搜索框）。tab 名匹配不上（改版/语言包）就按导航栏第一个 item 兜底，
+        顺序固定微信在最前。找不到 MainTabBar 返回 False，不抛。
         """
         if self._win is None and not self.ensure_window():
             return False
@@ -1440,13 +1464,40 @@ class WeChatUIA:
         if item is None:
             wxlog.debug("%s 下没有 %s，跳不回聊天页", MAIN_TAB_BAR_CLS, TAB_ITEM_CLS)
             return False
-        wxlog.debug("点导航栏「%s」栏，确保主窗停在聊天页", CHAT_TAB_NAME)
+
+        def _ready():
+            if not require_list:
+                return self._chat_page_ready(self._win)
+            w = self._find_main() or self._win
+            return _find_by(w, lambda c: _aid_hit(getattr(c, "AutomationId", ""),
+                                                  SESSION_LIST_AIDS),
+                            max_depth=30) is not None
+
+        if _ready():
+            # 会话列表/搜索框本来就在：一点都不用点。旧写法无条件先点一下，那一下
+            # 在窄窗口里正好把用户开着的会话切走。
+            wxlog.debug("聊天页那一片已经渲染，不点导航栏")
+            return True
         # 走 _click_ctrl 而不是 Control.Click()：后者是裸 mouse_event，会被
         # 渲染层的 WS_EX_TRANSPARENT 挡掉（见 _click_at 上方注释）。
-        if not self._click_ctrl(item):
-            return False
-        rhythm.nap(settle)
-        return True
+        for n in range(1, max(1, int(max_clicks)) + 1):
+            wxlog.debug("点导航栏「%s」栏第 %d 次，确保主窗回到聊天页/退出当前会话",
+                        CHAT_TAB_NAME, n)
+            if not self._click_ctrl(item):
+                return False
+            rhythm.nap(settle)
+            if _ready():
+                if n > 1:
+                    wxlog.info("点第 %d 次「%s」栏才退出会话（会话列表已渲染）",
+                               n, CHAT_TAB_NAME)
+                return True
+        # 点满还不算退出：窄窗口开着会话时搜索框不在树里，这一步不补点的话
+        # open_chat 的搜索框查找会直接失败，报出来的就是「会话打不开」。
+        wxlog.warning("点了 %d 次导航栏「%s」，会话列表和搜索框还是不在树里——"
+                      "主窗大概率还开着会话（窄窗口点一次退不出去），"
+                      "后面按搜索框/会话列表走的动作会失败",
+                      max(1, int(max_clicks)), CHAT_TAB_NAME)
+        return False
 
     def open_chat(self, keyword: str, index: Optional[int] = None,
                   section: Optional[str] = None, retries: int = 2) -> bool:
@@ -1457,8 +1508,11 @@ class WeChatUIA:
         """
         if not self.ensure_window():
             return False
-        # 搜索框只在聊天页渲染：主窗停在朋友圈页时这里先无条件点回「微信」栏。
-        self.back_to_chat_tab()
+        # 搜索框只在聊天页渲染：主窗停在朋友圈页、或窄窗口里还开着会话时，搜索框
+        # 根本不在树里。这里先把界面带回聊天页（必要时点两次退出会话）。
+        if not self.back_to_chat_tab():
+            wxlog.warning("没能带回聊天页（窄窗口里会话可能还开着），"
+                          "下面这步找不到搜索框就会失败")
         win = self._win
         box = self._search_box(win, expand=True)
         if box is None:

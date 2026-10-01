@@ -1994,19 +1994,21 @@ class MediaDownloader:
                 # 主窗停在朋友圈页时 `mmui::RecyclerListView` **真的不在树里**
                 # （实测各导航页里只有朋友圈会掉，通讯录/收藏/发现那几页树是一样的），
                 # 于是这里拿到 None。以前只警告一句就返回，看起来就是「UIA 没有任何操作」。
-                # 判页判不出来，只能无条件点一次「微信」标签再重新进会话。
                 wxlog.debug("消息列表不在树里（主窗大概率停在朋友圈页），"
                             "点「微信」标签回聊天页再试一次")
                 try:
-                    if _uia.back_to_chat_tab():
-                        time.sleep(1.0)
-                        try:
-                            from .wx import WeChat
-                            (wx if wx is not None else WeChat()).ChatWith(want_chat)
-                        except Exception as e:
-                            wxlog.debug("回聊天页后重新进会话失败：%s", type(e).__name__)
-                        time.sleep(1.5)
-                        lst = _uia._message_list()
+                    # 点几下、要不要点是 back_to_chat_tab 自己的事：窄窗口里开着会话时
+                    # 点一次只切到聊天页、退不出会话，它内部会补第二下。这里不管它
+                    # 返回什么都不猜，直接重新读一次列表——读得到就继续走。
+                    _uia.back_to_chat_tab()
+                    time.sleep(1.0)
+                    try:
+                        from .wx import WeChat
+                        (wx if wx is not None else WeChat()).ChatWith(want_chat)
+                    except Exception as e:
+                        wxlog.debug("回聊天页后重新进会话失败：%s", type(e).__name__)
+                    time.sleep(1.5)
+                    lst = _uia._message_list()
                 except Exception as e:
                     wxlog.debug("back_to_chat_tab 抛错：%s", type(e).__name__)
             if lst is None:
