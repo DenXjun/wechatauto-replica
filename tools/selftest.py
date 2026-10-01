@@ -1637,36 +1637,33 @@ def t_image() -> None:
         return _os.path.join(md.db.account_dir, 'msg', 'attach',
                              hashlib.md5(user.encode()).hexdigest(), '2026-09')
 
+    def _no_ui(*a, **k):
+        raise AssertionError("download_image 不该碰界面")
+
     mt = newmd({'thumb': 5000})
     mt.decrypt_image = stub_decrypt(mt, used)
-    calls = []
-
-    def fake_ui(user, lid, save_dir=None, aes_key=None, xor_key=None, want="original"):
-        calls.append(want)
-        with open(_os.path.join(fake_tree(mt), MD5 + '.dat'), 'wb') as f:
-            f.write(b'\0' * 100000)
-        return _os.path.join(save_dir or mt.save_dir, '%s_%s.jpg' % (user, lid))
-    mt.download_image_original = fake_ui
-    out = mt.download_image('wxid_img', 7, save_dir=mt.save_dir, tier='full')
-    check("本机只有预览图 → tier=full 让微信去下（want='mid'），下完拿的是完整图",
-          calls == ['mid'] and out.endswith('wxid_img_7.jpg')
-          and used[-1].endswith(MD5 + '.dat'), "%s %s" % (calls, _os.path.basename(out or '')))
-    calls[:] = []
-    check("本机已有完整图 → tier=full 一次界面都不碰",
-          mt.download_image('wxid_img', 7, save_dir=mt.save_dir, tier='full')
-          .endswith('wxid_img_7.jpg') and calls == [], str(calls))
-    mt2 = newmd({'thumb': 5000})
-    mt2.download_image_original = lambda *a, **k: None
-    check("走完一轮界面还是没有完整图 → None（不拿预览图凑数）",
-          mt2.download_image('wxid_img', 7, tier='full') is None)
+    mt.download_image_original = _no_ui
+    check("本机只有预览图 → tier=full 返回 None，**不去碰界面**（要下就用 download_image_original）",
+          mt.download_image('wxid_img', 7, save_dir=mt.save_dir, tier='full') is None)
+    mm = newmd({'mid': 100000, 'thumb': 5000})
+    mm.decrypt_image = stub_decrypt(mm, used)
+    mm.download_image_original = _no_ui
+    out = mm.download_image('wxid_img', 7, save_dir=mm.save_dir, tier='full')
+    check("本机有完整图 → tier=full 交完整图、文件名不带档位标记（绝不用预览图凑数）",
+          out.endswith('wxid_img_7.jpg') and used[-1].endswith(MD5 + '.dat'), str(out))
+    mh = newmd({'original': 200000, 'mid': 100000, 'thumb': 5000})
+    mh.decrypt_image = stub_decrypt(mh, used)
+    mh.download_image_original = _no_ui
+    out = mh.download_image('wxid_img', 7, save_dir=mh.save_dir, tier='full')
+    check("本机有原件 → tier=full 优先交原件并标 _h",
+          out.endswith('wxid_img_7_h.jpg') and used[-1].endswith(MD5 + '_h.dat'),
+          _os.path.basename(out or ''))
     mt3 = newmd({})
-    seen = []
-    mt3.download_image_original = lambda *a, **k: (seen.append(k.get('want')), None)[1]
-    check("附件目录里这条图压根没出现过 → tier=full 也会去下（want='mid'）",
-          mt3.download_image('wxid_img', 7, save_dir=mt3.save_dir, tier='full') is None
-          and seen == ['mid'], str(seen))
-    check("同样什么都没有的时候，老的 tier=None 照旧直接返回 None（不碰界面）",
-          mt3.download_image('wxid_img', 7, save_dir=mt3.save_dir) is None and seen == ['mid'])
+    mt3.download_image_original = _no_ui
+    check("附件目录里这条图压根没出现过 → tier=full 返回 None 且不碰界面",
+          mt3.download_image('wxid_img', 7, save_dir=mt3.save_dir, tier='full') is None)
+    check("want='full' 等的是两档（元组里原件在前）",
+          MediaDownloader._WAIT_TIERS['full'] == ("original", "mid"))
 
     print("[image] image_status 里「有没有完整图」和「有没有原件」分开答")
     check("mid_only 时 has_full=True（有完整图，只是没有勾了原图那一档）",
@@ -1705,29 +1702,77 @@ def t_image() -> None:
     check("sort_seq 缺失时返回 0",
           MediaDownloader._newer_image_count(mdc, 'u', None) == 0)
 
-    print("[image] 等 _h.dat 下完")
+    print("[image] 等本机出现目标那一档")
     tdir = tempfile.mkdtemp(prefix='wxwait-')
     tmpdirs.append(tdir)
     p0 = _os.path.join(tdir, 'zero.dat')
     p1 = _os.path.join(tdir, 'full.dat')
     open(p0, 'wb').write(b'\0' * 0)
     open(p1, 'wb').write(b'\0' * 60000)
-    seq = [p0, p0, p1, p1]
-    mw = MediaDownloader.__new__(MediaDownloader)
-    mw._find_h_dat = lambda u, m: seq.pop(0) if seq else p1
-    got = mw._wait_h_dat('u', MD5, until=_time.time() + 6)
-    check("先 0 后 60000 且稳定 → 判定下完", got is not None and got[1] == 60000, str(got))
-    mw2 = MediaDownloader.__new__(MediaDownloader)
-    mw2._find_h_dat = lambda u, m: p0
-    check("一直是 0 字节 → 到点返回 None（不返回半截文件）",
-          mw2._wait_h_dat('u', MD5, until=_time.time() + 0.1) is None)
     small = _os.path.join(tdir, 'small.dat')
-    open(small, 'wb').write(b'\0' * 3000)          # 比压缩版小，但已经不再变化
+    open(small, 'wb').write(b'\0' * 3000)      # 已经不再变化，但比压缩版小
+
+    def files_of(seq, n=[0]):
+        """把 _image_files 演成「前几次还是 0 字节，之后稳定在某个文件」。"""
+        def _f(u, m):
+            n[0] += 1
+            p = seq[min(n[0] - 1, len(seq) - 1)]
+            return {'original': (p, _os.path.getsize(p))}
+        return _f
+    mw = MediaDownloader.__new__(MediaDownloader)
+    mw._image_files = files_of([p0, p0, p1, p1])
+    got = mw._wait_tier('u', MD5, until=_time.time() + 6)
+    check("先 0 后 60000 且稳定 → 判定下完（交回的三元组里带档位）",
+          got is not None and got[0] == 'original' and got[2] == 60000, str(got))
+    mw2 = MediaDownloader.__new__(MediaDownloader)
+    mw2._image_files = files_of([p0])
+    check("一直是 0 字节 → 到点返回 None（不返回半截文件）",
+          mw2._wait_tier('u', MD5, until=_time.time() + 0.1) is None)
     mw3 = MediaDownloader.__new__(MediaDownloader)
-    mw3._find_h_dat = lambda u, m: small
-    got3 = mw3._wait_h_dat('u', MD5, until=_time.time() + 3)
+    mw3._image_files = files_of([small])
+    got3 = mw3._wait_tier('u', MD5, until=_time.time() + 3)
     check("尺寸不再变化就算下完（不再拿它和压缩版比大小）",
-          got3 is not None and got3[1] == 3000, str(got3))
+          got3 is not None and got3[2] == 3000, str(got3))
+    # want='full' 的等法：两档都认，谁先稳定交谁；两档同时都在时优先交原件。
+    mw4 = MediaDownloader.__new__(MediaDownloader)
+    mw4._image_files = lambda u, m: {'mid': (p1, 60000)}
+    got4 = mw4._wait_tier('u', MD5, until=_time.time() + 6,
+                         tiers=("original", "mid"))
+    check("等两档时本机只有完整图 → 交 mid（调用方要的就是非预览图）",
+          got4 is not None and got4[0] == 'mid', str(got4))
+    mw5 = MediaDownloader.__new__(MediaDownloader)
+    both = {'original': (p1, 60000), 'mid': (small, 3000)}
+    mw5._image_files = lambda u, m: dict(both)
+    got5 = mw5._wait_tier('u', MD5, until=_time.time() + 6,
+                         tiers=("original", "mid"))
+    check("两档都在时按优先级交原件（不是一拿到就交第一个）",
+          got5 is not None and got5[0] == 'original', str(got5))
+    mw6 = MediaDownloader.__new__(MediaDownloader)
+    mw6._image_files = lambda u, m: {'mid': (p1, 60000)}
+    check("只等原件时本机只有完整图 → 到点 None（want='original' 不能拿它凑数）",
+          mw6._wait_tier('u', MD5, until=_time.time() + 0.1,
+                         tiers=("original",)) is None)
+    mw7 = MediaDownloader.__new__(MediaDownloader)
+    tick = [0]
+
+    def growing(u, m):
+        tick[0] += 1
+        return {'original': (p1, 1000 + tick[0] * 500)}   # 一直在长，从不稳定
+    mw7._image_files = growing
+    got7 = mw7._wait_tier('u', MD5, until=_time.time() + 1.2)
+    check("到点时哪怕还在长也交出去（已经可用的文件比一句「失败」有用，沿用旧行为）",
+          got7 is not None and got7[0] == 'original', str(got7))
+    mw8 = MediaDownloader.__new__(MediaDownloader)
+    grow = [0]
+
+    def both_moving(u, m):
+        grow[0] += 1
+        return {'mid': (small, 3000 + grow[0]), 'original': (p1, 60000 + grow[0])}
+    mw8._image_files = both_moving
+    got8 = mw8._wait_tier('u', MD5, until=_time.time() + 1.2,
+                          tiers=("original", "mid"))
+    check("两档都还在长、到点只能交一档时交的是原件（优先级只有一处代码在管）",
+          got8 is not None and got8[0] == 'original', str(got8))
 
     print("[image] db.get_image_rows 带出 packed_info")
     conn = sqlite3.connect(':memory:')
@@ -2132,6 +2177,10 @@ def t_image() -> None:
     class SearchEdit(Edit):
         ClassName, Name = "SearchEditBox", "搜索框"
 
+    class TypeEdit(Edit):
+        """「保存类型」那颗下拉框里层的小 Edit（当前格式就显示在那儿）。"""
+        ClassName, Name = "Edit", "保存类型:"
+
     class Combo(Node):
         ControlTypeName = "ComboBoxControl"
 
@@ -2152,13 +2201,21 @@ def t_image() -> None:
 
     fn_edit = FileNameEdit()
     btn_save, btn_cancel = DlgBtn("保存(S)"), DlgBtn("取消")
-    dlg = SaveDlg([Combo("文件名:", [fn_edit]), SearchEdit(), btn_save, btn_cancel])
+    # 实机点错过一次：目标是「保存(S)」那颗按钮，点到的却是「选择文件格式」那颗下拉框。
+    # 能解释这件事的只有「那颗下拉框在 UIA 里的 Name 也叫保存」——所以按 Name 前缀匹配
+    # 不够，必须再看控件类型。这里把它排在按钮**前面**，DFS 先碰到它。
+    type_combo = Combo("保存", [])
+    dlg = SaveDlg([type_combo, Combo("文件名:", [fn_edit]), SearchEdit(),
+                   btn_save, btn_cancel])
     check("文件名框按 Name 挑，不会填进右上角那个「搜索框」Edit",
           MediaDownloader._file_name_edit(dlg) is fn_edit,
           str(MediaDownloader._file_name_edit(dlg)))
     check("按钮按前缀匹配（实机文案带助记符「保存(S)」）",
           MediaDownloader._dialog_button(dlg, ("保存", "Save")) is btn_save
           and MediaDownloader._dialog_button(dlg, ("取消", "Cancel")) is btn_cancel)
+    check("Name 也叫「保存」的那颗下拉框不算按钮——绝不点它（实机就点到过它）",
+          MediaDownloader._dialog_button(dlg, ("保存", "Save")) is not type_combo
+          and "Button" not in (type_combo.ControlTypeName or ""))
     check("填路径 + 点「保存(S)」全程用 ValuePattern/Invoke，不发键盘",
           ms._fill_save_dialog(dlg, r"D:\out\pic.jpg") is True
           and fn_edit.value == r"D:\out\pic.jpg" and btn_save.invoked == 1,
@@ -2168,6 +2225,13 @@ def t_image() -> None:
     check("对话框里没有文件名框时不硬来",
           ms._fill_save_dialog(SaveDlg([SearchEdit(), DlgBtn("保存(S)")]),
                                r"D:\out\p.jpg") is False)
+    # 实机那种：文件名框没认出来，兜底「第一个 Edit」正好落在「保存类型」那颗下拉框
+    # 里面的 Edit 上——值写进了格式选择器，点「保存」自然什么文件都没写出。
+    type_only = SaveDlg([Combo("保存类型:", [TypeEdit()]),
+                         SearchEdit(), btn_save, btn_cancel])
+    check("兜底找「第一个 Edit」时也绝不返回「保存类型」那颗 Edit（实机就写到那儿去了）",
+          MediaDownloader._first_edit(type_only) is None
+          and ms._fill_save_dialog(type_only, r"D:\out\q.jpg") is False)
 
     # 对话框刚关/切页时 UIA 树会在遍历中途失效：读属性、取子节点都可能抛。
     # 这类异常一旦抛出去就把整条「保存」兜底路线打死（上一轮真机就是被一个
@@ -2214,6 +2278,10 @@ def t_image() -> None:
         _auto.GetRootControl = lambda: RootOf([Top("#32770", "属性", [Node()])])
         check("没有「保存」按钮的 #32770 不算（别的应用的通用对话框）",
               MediaDownloader._save_dialog() is None)
+        _auto.GetRootControl = lambda: RootOf(
+            [Top("#32770", "打开", [Combo("保存", [])])])
+        check("里面只有一颗 Name 叫「保存」的下拉框（不是按钮）→ 不当成保存对话框",
+              MediaDownloader._save_dialog() is None)
     finally:
         _auto.GetRootControl = _orig_root3
 
@@ -2221,30 +2289,65 @@ def t_image() -> None:
     made = ms.save_dir
 
     class SaveToFileBtn(DlgBtn):
-        def __init__(self, name, edit):
+        """点了就写真文件、并把对话框“关掉”的保存按钮（对话框关掉才是点中的证据）。"""
+
+        def __init__(self, name, edit, state=None):
             DlgBtn.__init__(self, name)
-            self.edit = edit
+            self.edit, self.state = edit, state
 
         def Invoke(self):
             self.invoked += 1
             if self.edit.value:
                 with open(self.edit.value, "wb") as f:
                     f.write(JPG)
+            if self.state is not None:
+                self.state["open"] = False
 
     fn2 = FileNameEdit()
-    ok_btn = SaveToFileBtn("保存(S)", fn2)
-    dlg2 = SaveDlg([Combo("文件名:", [fn2]), SearchEdit(), ok_btn, DlgBtn("取消")])
+    st2 = {"open": True}
+    ok_btn = SaveToFileBtn("保存(S)", fn2, st2)
+    dlg2 = SaveDlg([Combo("保存类型:", []), Combo("文件名:", [fn2]),
+                    SearchEdit(), ok_btn, DlgBtn("取消")])
     ms3 = MediaDownloader.__new__(MediaDownloader)
     ms3.db = AccDB()
     ms3.save_dir = tempfile.mkdtemp(prefix='wxdlg-')
     tmpdirs.append(ms3.save_dir)
     ms3._find_preview_button = lambda w, name: (DlgBtn("保存") if name == "保存" else None)
-    ms3._save_dialog = staticmethod(lambda: dlg2)
+    ms3._save_dialog = staticmethod(lambda: dlg2 if st2["open"] else None)
     got3 = ms3._save_via_button(Win(), ms3.save_dir, "wxid_img_7",
                                 _time.time() + 25, _time.time())
-    check("点「保存」→ 对话框里填目标路径 → 文件真的落在 save_dir 并返回该路径",
+    check("点「保存」→ 填目标路径 → 点中按钮（对话框关掉）→ 文件真的落在 save_dir",
           got3 and got3.endswith("wxid_img_7.jpg") and _os.path.isfile(got3)
           and ok_btn.invoked == 1, "%s 按钮点了 %d 次" % (got3, ok_btn.invoked))
+
+    # 实机那种「没点中按钮」的形状：Invoke 跑了、文件没写出、**模态框还开着**。
+    # 这时候必须认出来并点「取消」收尾，不能白等 8 秒再报一句看不清的话。
+    fn3 = FileNameEdit()
+    st3 = {"open": True}
+
+    class NoCloseBtn(DlgBtn):
+        def __init__(self, name, edit):
+            DlgBtn.__init__(self, name)
+            self.edit = edit
+
+        def Invoke(self):
+            self.invoked += 1        # 假装点到的是那颗格式下拉框：什么都不写、窗也不关
+
+    stuck_btn = NoCloseBtn("保存(S)", fn3)
+    cancelled2 = DlgBtn("取消")
+    dlg3 = SaveDlg([Combo("保存类型:", []), Combo("文件名:", [fn3]),
+                    SearchEdit(), stuck_btn, cancelled2])
+    ms5 = MediaDownloader.__new__(MediaDownloader)
+    ms5.db = AccDB()
+    ms5.save_dir = tempfile.mkdtemp(prefix='wxdlg3-')
+    tmpdirs.append(ms5.save_dir)
+    ms5._find_preview_button = lambda w, name: (DlgBtn("保存") if name == "保存" else None)
+    ms5._save_dialog = staticmethod(lambda: dlg3)
+    got5 = ms5._save_via_button(Win(), ms5.save_dir, "nope", _time.time() + 25, _time.time())
+    check("对话框没关掉 = 那一下没点中按钮 → 返回 None、点「取消」收尾、不留下模态框",
+          got5 is None and cancelled2.invoked == 1 and stuck_btn.invoked == 1,
+          "%s 取消点了 %d 次" % (got5, cancelled2.invoked))
+
     ms4 = MediaDownloader.__new__(MediaDownloader)
     ms4.db = AccDB()
     ms4.save_dir = tempfile.mkdtemp(prefix='wxdlg2-')
@@ -2257,6 +2360,85 @@ def t_image() -> None:
     check("对话框里挑不到文件名框 → 返回 None 并且点了「取消」收尾",
           got4 is None and cancelled.invoked == 1,
           "%s 取消点了 %d 次" % (got4, cancelled.invoked))
+
+    print("[image] 「保存」第一遍可能是预览图那一份 → 点「图片原始大小」再存一遍")
+    lp = MediaDownloader._looks_preview
+    check("比本机完整图小两成以上 → 判为预览图", lp(60000, ref_mid=100000) is True)
+    check("和本机完整图同量级 → 就是完整图，不再多点一轮界面",
+          lp(95000, ref_mid=100000) is False)
+    check("本机没有 .dat 时只和缩略图比：不超过它 1.3 倍才算预览图",
+          lp(20000, ref_thumb=18000) is True and lp(60000, ref_thumb=18000) is False)
+    check("参照不足（本机两档都没有）→ 不猜，绝不为了猜而多点一轮界面",
+          lp(20000) is False and lp(0, ref_mid=100000) is False)
+
+    class ClickBtn(Node):
+        ControlTypeName, ClassName = "ButtonControl", "mmui::XButton"
+
+        def __init__(self, name):
+            self.Name, self.clicked = name, 0
+
+        def Click(self):
+            self.clicked += 1
+
+    mz = MediaDownloader.__new__(MediaDownloader)
+    b_req = ClickBtn("图片原始大小")
+    mz._find_preview_button = lambda w, name: b_req
+    check("重存之前先点「图片原始大小」逼原件进显示（状态对才点）",
+          mz._click_zoom_to_load(None) is True and b_req.clicked == 1,
+          str(b_req.clicked))
+    b_shown = ClickBtn("图片适应窗口大小")
+    mz._find_preview_button = lambda w, name: b_shown
+    check("原件本来就在显示中就不点它（点一下会缩回去，反而存成缩放版）",
+          mz._click_zoom_to_load(None) is False and b_shown.clicked == 0,
+          str(b_shown.clicked))
+    mz._find_preview_button = lambda w, name: None
+    check("查看器里没有这颗按钮时不硬点（还是会把上一份交出去）",
+          mz._click_zoom_to_load(None) is False)
+
+    ms6 = MediaDownloader.__new__(MediaDownloader)
+    ms6.db = AccDB()
+    ms6.save_dir = tempfile.mkdtemp(prefix='wxdlg4-')
+    tmpdirs.append(ms6.save_dir)
+    seq6 = [18000, 95000]
+    calls6 = []
+    zoom6 = []
+
+    def once6(win, target, deadline, t0):
+        calls6.append(target)
+        n = min(len(calls6) - 1, len(seq6) - 1)
+        sz = seq6[n]
+        if not sz:
+            return None                    # 这一次「保存」什么都没写出来
+        with open(target, "wb") as f:
+            f.write(b"\0" * sz)
+        return sz
+    ms6._save_once = once6
+    ms6._click_zoom_to_load = lambda win: (zoom6.append(1) or True)
+    got6 = ms6._save_via_button(Win(), ms6.save_dir, "again", _time.time() + 25,
+                                _time.time(), ref_thumb=17000, ref_mid=95000)
+    check("第一遍写出的是预览图那份 → 点「图片原始大小」再存一遍，最后交大的那份",
+          got6 and got6.endswith("again.jpg") and len(calls6) == 2 and zoom6 == [1]
+          and _os.path.getsize(got6) == 95000,
+          "%s 保存点了 %d 次" % (got6, len(calls6)))
+    calls6[:] = []
+    zoom6[:] = []
+    got7 = ms6._save_via_button(Win(), ms6.save_dir, "noframe", _time.time() + 25,
+                                _time.time())          # 不传参照
+    check("没有参照时只点一遍「保存」（第一遍就当成可用）",
+          got7 is not None and len(calls6) == 1 and zoom6 == [],
+          "%s %d %s" % (got7, len(calls6), zoom6))
+    calls6[:] = []
+    seq6[:] = [18000, 18000]
+    got8 = ms6._save_via_button(Win(), ms6.save_dir, "again", _time.time() + 25,
+                                _time.time(), ref_thumb=17000, ref_mid=95000)
+    check("两遍都还是预览图 → 也把本机最好的那份交出去（并说明只能让对方重发原图）",
+          got8 is not None and len(calls6) == 2, "%s %d" % (got8, len(calls6)))
+    calls6[:] = []
+    seq6[:] = [None]
+    got9 = ms6._save_via_button(Win(), ms6.save_dir, "gone", _time.time() + 25,
+                                _time.time(), ref_thumb=17000, ref_mid=95000)
+    check("「保存」这次根本没写出东西 → 返回 None，不拿上一次的残留冒充成功",
+          got9 is None or _os.path.getsize(got9) > 0, str(got9))
 
     print("[image] verify=True 时按结构判完整")
     mv._image_files = lambda u, m: {"original": (new_jpg, 5000)}
@@ -2443,15 +2625,19 @@ def t_image() -> None:
             self.clicked += 1
 
     saved_calls = []
+    saved_kw = []
 
     def smoke(sender, pid_ok=True, has_button=True, chat=None, pre_open=False,
               zoom="request", h_dat=True, save_returns=None,
-              tiers="none", tiers_after=None, own=None, index=None, want="original"):
+              tiers="none", tiers_after=None, own=None, index=None, want=None,
+              two_rows=False, flip_at=1):
         """zoom: request=「图片原始大小」/ shown=「图片适应窗口大小」/ none=找不到那颗键
 
         tiers: 本机附件目录里有哪些档（none=什么都没有 / mid=只有完整图 /
                thumb=只有预览图 / h=有 _h.dat）
         tiers_after: 点过界面**之后**才出现的档位（模拟「点开预览微信才把 .dat 下下来」）
+        flip_at: 第几次查盘之后才让它出现（默认 1；调大就能只喂到后面那一次补查）
+        two_rows: 可视区里有两张图片气泡（用来证明「已经拿到了就别点第二张」）
         """
         FakeGui.pid = 4321 if pid_ok else None
         FakeUIA.no_hwnd = not pid_ok
@@ -2472,10 +2658,17 @@ def t_image() -> None:
             "thumb": {"thumb": ("C:\\tmp\\x_t.dat", 900)},
             "h": {"original": ("C:\\tmp\\x_h.dat", 5000),
                   "mid": ("C:\\tmp\\x.dat", 900)}}[tiers_after] if tiers_after else None
-        ms._image_files = lambda u, m: dict(
-            _t1 if (_t1 is not None and clicks) else _t0)
-        ms._visible_rows = lambda lst: [("image", "图片", Ctl(700)),
-                                        ("text", "正文一行", Ctl(950))]
+        nscan = [0]
+
+        def _files(u, m):
+            nscan[0] += 1
+            return dict(_t1 if (_t1 is not None and clicks and nscan[0] >= flip_at)
+                        else _t0)
+        ms._image_files = _files
+        rows = [("image", "图片", Ctl(700)), ("text", "正文一行", Ctl(950))]
+        if two_rows:
+            rows = rows + [("image", "图片", Ctl(1200))]
+        ms._visible_rows = lambda lst: list(rows)
         zoom_btn = FakeBtn({"request": "图片原始大小",
                             "shown": "图片适应窗口大小"}.get(zoom, "")) \
             if zoom != "none" else None
@@ -2488,8 +2681,9 @@ def t_image() -> None:
             return FakeBtn("保存") if has_button else None
         ms._find_preview_button = _find
 
-        def _save(win, save_dir, stem, deadline, t0):
+        def _save(win, save_dir, stem, deadline, t0, **kw):
             saved_calls.append(stem)
+            saved_kw.append(kw)
             return save_returns
         ms._save_via_button = _save
 
@@ -2501,15 +2695,22 @@ def t_image() -> None:
         # pre_open=True 模拟「本来就开着一张大图」——那种窗不能当成果。
         ms._preview_windows = lambda: ([(99, FakePreview())]
                                        if (pre_open or clicks) else [])
-        ms._wait_h_dat = lambda u, m, min_bytes=1024, until=None, tier="original": (
-            waited.append(tier) or (("C:\\tmp\\x_h.dat", 5000) if h_dat else None))
-        ms._find_h_dat = lambda u, m: "C:\\tmp\\x_h.dat"
+        def _wait(u, m, min_bytes=1024, until=None, tiers=("original",)):
+            waited.append(tiers)
+            if not h_dat:
+                return None
+            t = "original" if "original" in tiers else tiers[-1]
+            return (t, "C:\\tmp\\x%s.dat" % ("_h" if t == "original" else ""), 5000)
+        ms._wait_tier = _wait
         ms.decrypt_image = lambda p, a=None, x=None: (decrypted.append(p) or JPEG)
         ua, wxm, gu = _ud.WeChatUIA, _wxm.WeChat, _g.WinInput
         _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = FakeUIA, FakeWX, FakeInput
         try:
+            # want=None 时**不传这个参数**——那才是验「库自己的默认口径」的走法，
+            # 传 want=None 会被入口的兜底改掉，默认值写错也测不出来。
+            kw = {} if want is None else {"want": want}
             out = ms.download_image_original("wxid_img", 7, timeout=3.0,
-                                             chat_name="显示名", want=want)
+                                             chat_name="显示名", **kw)
         finally:
             _ud.WeChatUIA, _wxm.WeChat, _g.WinInput = ua, wxm, gu
             FakeUIA.no_hwnd = False
@@ -2524,9 +2725,21 @@ def t_image() -> None:
     check("函数体走完并解密落盘（没走到就报 NameError/AttributeError）",
           bool(out0) and out0.endswith("wxid_img_7.jpg") and _os.path.exists(out0),
           str(out0))
-    check("默认 want='original'：等的是 _h.dat、解密的也是 _h.dat",
-          waited == ["original"] and decrypted and decrypted[-1].endswith("x_h.dat"),
-          "%s %s" % (waited, decrypted[-1:]))
+    check("默认 want='full'：两档一起等（原件优先，完整图也算拿到）",
+          waited == [("original", "mid")], str(waited))
+    check("交回来的路径就是解密的那个文件（不再自己回去找 _h.dat）",
+          decrypted and decrypted[-1].endswith("x_h.dat"), str(decrypted[-1:]))
+    waited.clear()
+    decrypted.clear()
+    clicks.clear()          # 上一轮的点击会让预览窗被当成「本来就开着」，这轮要清掉
+    smoke(None, chat="显示名", want="original")
+    check("want='original' 时只等 _h.dat（不会把完整图当原件交出去）",
+          waited == [("original",)], str(waited))
+    clicks.clear()
+    waited.clear()
+    smoke(None, chat="显示名", want="whatever")
+    check("乱写的 want 按 'full' 走（不误入只追原件那条，也不静默崩）",
+          waited == [("original", "mid")], str(waited))
     check("走到了点击那一步（不是提前 return）", len(clicks) >= 1, str(clicks))
     check("别人发的：先点左边 x=777", clicks and clicks[0][0] == 777, str(clicks[:2]))
     check("缩放键处于「图片原始大小」状态时才点它（按名字点，不按比例猜）",
@@ -2560,22 +2773,29 @@ def t_image() -> None:
     check("读不到当前会话标题时也照常进入（保守：宁可多搜一次）",
           chatwith == ["显示名"], str(chatwith))
 
-    # 「我发的图片提示找不到原图」的真相：自己发出去的图本机一般没有 _h.dat
-    # （实测 554 条自发图片里只有 19 条有，而那 19 条都没有 .dat）。为这种图去点
-    # 一轮界面没有任何收益，还平白多一次真实界面动作——直接返回 None 并说明办法。
+    # download_image_original 的口径（用户拍的）：**返回非预览图**。本机有完整图就
+    # 直接解密落盘，一步界面都不碰；两档都没有才去点。只有明说要原件（want='original'）
+    # 时，「自己发的图本机一般没有原件」才成立——那种情况直接 None，不白点一轮界面。
     clicks.clear()
     chatwith.clear()
     out_mid, _b = smoke(1, chat="显示名", tiers="mid")
-    check("自己发的 + 本机只有压缩版 → 直接 None，一次界面都不碰",
-          out_mid is None and not clicks and not chatwith,
+    check("默认要非预览图：本机已有完整图 → 直接落盘，一次界面都不碰",
+          out_mid is not None and not clicks and not chatwith,
           "%s 点击=%s 搜索=%s" % (out_mid, clicks, chatwith))
     clicks.clear()
+    chatwith.clear()
+    out_o, _b = smoke(1, chat="显示名", tiers="mid", want="original")
+    check("want='original' + 自己发的 + 只有完整图 → 直接 None（实测 554 条自发图只有 19 条有原件，"
+          "点界面也点不出更大的东西）",
+          out_o is None and not clicks and not chatwith,
+          "%s 点击=%s 搜索=%s" % (out_o, clicks, chatwith))
+    clicks.clear()
     out_thumb, _b2 = smoke(1, chat="显示名", tiers="thumb")
-    check("自己发的但连 .dat 都没有 → 仍然走界面（打开预览会让微信把压缩版下下来）",
+    check("自己发的但连完整图都没有 → 仍然走界面（打开预览才会把 .dat 下下来）",
           bool(clicks), str(clicks[:1]))
     clicks.clear()
-    smoke(None, chat="显示名", tiers="mid")
-    check("别人发的 + 只有压缩版 → 照常走界面（这才是「点一下就能下原图」的那种）",
+    smoke(None, chat="显示名", tiers="mid", want="original")
+    check("别人发的 + 只有完整图 + want='original' → 这才是要追原件的那种，照常走界面",
           bool(clicks), str(clicks[:1]))
     clicks.clear()
     chatwith.clear()
@@ -2583,32 +2803,55 @@ def t_image() -> None:
     check("本机已有合格 _h.dat → 不碰界面，直接解密落盘",
           out_h is not None and not clicks and not chatwith, "%s %s" % (out_h, clicks))
 
-    # want='mid'：调用方要的是「非预览图的完整图」，不是勾了原图那份。
-    # 那种情况下点缩放键是没道理的（点它才会去追原件），等的那一档也不是 _h.dat。
+    # want='full'（默认）：非预览图算成功，所以等的是两档；原件仍然优先——
+    # 缩放键该点就点，点在「图片原始大小」那一档上是拿到原件的唯一途径。
     clicks.clear()
     chatwith.clear()
     waited.clear()
     decrypted.clear()
-    out_m, btn_m = smoke(None, chat="显示名", tiers="thumb", tiers_after="mid",
-                         want="mid")
-    check("want='mid' 时不点缩放键（它只会把显示切去追原件）",
-          btn_m is not None and btn_m.clicked == 0, str(btn_m and btn_m.clicked))
-    check("want='mid' 时等的是 .dat 那一档（tier 传对了）",
-          waited == ["mid"], str(waited))
-    check("want='mid' 点完界面解密的是 .dat（不是 _h.dat）",
+    out_m, btn_m = smoke(None, chat="显示名", tiers="thumb", tiers_after="mid")
+    check("want='full' 时等的是两档", waited == [("original", "mid")], str(waited))
+    check("want='full' 时该点缩放键还是点（原件比完整图更好）",
+          btn_m is not None and btn_m.clicked == 1, str(btn_m and btn_m.clicked))
+    check("want='full' 走完界面把交回来的那一档解密落盘",
           out_m is not None and _os.path.isfile(out_m)
-          and decrypted[-1].endswith("x.dat"), "%s %s" % (out_m, decrypted[-1:]))
+          and decrypted[-1] == "C:\\tmp\\x_h.dat", "%s %s" % (out_m, decrypted[-1:]))
     clicks.clear()
     waited.clear()
-    out_ms, _b = smoke(1, chat="显示名", tiers="thumb", tiers_after="mid", want="mid")
-    check("自己发的图 + want='mid' → 不适用「本机没有原件就直接 None」那条（完整图才是目标）",
-          bool(clicks) and out_ms is not None and waited == ["mid"],
-          "%s %s %s" % (bool(clicks), out_ms, waited))
+    out_mo, _b = smoke(1, chat="显示名", tiers="thumb", want="original")
+    check("want='original' 只等一档（追不到原件就拿完整图凑数是错的）",
+          waited == [("original",)] and bool(clicks), str(waited))
+    saved_kw.clear()
+    clicks.clear()          # 不清的话上一轮的预览窗会被当成「本来就开着」，走不到「保存」
+    smoke(None, chat="显示名", tiers="mid", want="original", h_dat=False)
+    check("走「保存」兜底时把本机那两档的尺寸带过去（不带走就没法判断存出来的是不是预览图）",
+          bool(saved_kw) and saved_kw[-1].get("ref_mid") == 5000, str(saved_kw[-1:]))
+
+    # 用户实测：点完第一张之后微信才把文件写完 —— 于是「明明已经拿到了还在一张一张
+    # 瞎点，最后报下载失败；重新运行又说已在本地」。现在每个决策点都先回头看一眼盘：
+    # 进门、点下一张之前、等档超时之后、判失败之前。
     clicks.clear()
-    chatwith.clear()
-    out_mm, _b2 = smoke(1, chat="显示名", tiers="mid", want="mid")
-    check("want='mid' 且本机已有完整图 → 直接解密落盘，一步界面都不碰",
-          out_mm is not None and not clicks and not chatwith, "%s %s" % (out_mm, clicks))
+    saved_calls.clear()
+    out_late = smoke(None, chat="显示名", tiers="thumb", tiers_after="mid",
+                     h_dat=False)[0]
+    check("等档超时之后本机才出现 → 补查到了就交文件，不再去点「保存」",
+          out_late is not None and len(clicks) == 1 and saved_calls == [],
+          "%s 点击=%s 保存=%s" % (out_late, clicks, saved_calls))
+    clicks.clear()
+    out_iter = smoke(None, chat="显示名", tiers="thumb", tiers_after="mid", h_dat=False,
+                     two_rows=True, flip_at=4)[0]
+    check("要点第二张之前先查盘：已经拿到了就不再点第二张",
+          out_iter is not None and len(clicks) == 1, "%s 点击=%s" % (out_iter, clicks))
+    clicks.clear()
+    out_final = smoke(None, chat="显示名", tiers="thumb", tiers_after="mid", h_dat=False,
+                      pre_open=True, flip_at=3)[0]
+    check("整轮界面走完、判失败之前再查一次盘（超时那一瞬间才落盘的算拿到）",
+          out_final is not None and len(clicks) == 1, "%s %s" % (out_final, clicks))
+    clicks.clear()
+    out_none = smoke(None, chat="显示名", tiers="thumb", tiers_after="mid", h_dat=False,
+                     pre_open=True, flip_at=99)[0]
+    check("补查也查不到 → 照旧明确返回 None（不把「没拿到」粉饰成成功）",
+          out_none is None, str(out_none))
     plans.clear()
     smoke(None, pid_ok=False, chat="显示名")
     check("拿不到进程 id → 绝不滚界面（max_scrolls=0，落点无法校验）",

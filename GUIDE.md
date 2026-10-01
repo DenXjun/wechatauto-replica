@@ -440,13 +440,16 @@ md.detect_image_key()          # 扫描进程内存提取密钥（首次需要�
 out = md.download_media("filehelper", 123, save_dir=r"D:\media")
 
 out = md.download_image("filehelper", 123)      # jpg/png/gif（旧行为）
-out = md.download_image("filehelper", 123, tier="best")    # 原图>压缩版>缩略图，档位标在文件名（§6.2.2）
+out = md.download_image("filehelper", 123, tier="best")    # 原件>完整图>预览图，档位标在文件名（§6.2.2）
+out = md.download_image("filehelper", 123, tier="full")    # 只要非预览图，本机没有就 None（不碰界面）
 out = md.download_voice("filehelper", 123)      # .silk
 out = md.download_video("filehelper", 123)      # .mp4
 out = md.download_file("filehelper", 123)       # 原文件 / original file
 
-# 下载原图（通过UI点击触发微信下载）/ download original image (UI click triggers download)
+# 拿非预览图：本机有就解密、没有就驱动界面让微信下 / fetch the non-thumbnail copy
 out = md.download_image_original("filehelper", 123, timeout=30)
+# 只认「发的时候勾了原图」那一档，追不到就 None（不会拿完整图凑数）
+out = md.download_image_original("filehelper", 123, want="original")
 ```
 
 返回落盘路径，失败返回 `None`。 / Returns the saved path, or `None` on failure.
@@ -507,7 +510,7 @@ out = md.download_image("群名", 123)                    # 不传 tier = 旧行
 |---|---|---|---|
 | `None`（默认） | 完整图 → 预览图 | `<user>_<lid>.jpg` / `..._thumb.jpg` | 退预览图 |
 | `'original'` | 只有 `_h.dat`（原件） | `..._h.jpg` | `None`（**不悄悄降级**） |
-| `'full'` | 原件 → 完整图，**绝不用预览图交差** | 按档位标 `_h` / 无 | 让微信去下（点开预览那一步本身就会下 `.dat`），下完还没有才 `None` |
+| `'full'` | 原件 → 完整图，**绝不用预览图交差**；**只读本机，不碰界面** | 按档位标 `_h` / 无 | 本机只有预览图时 `None`（要让微信去下用 `download_image_original()`） |
 | `'best'` | 原件 → 完整图 → 预览图 | 按档位标 `_h` / 无 / `_thumb` | `None` |
 | `'mid'` / `'thumb'` | 只要这一档 | 无 / `_thumb` | `None` |
 
@@ -527,8 +530,8 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
 | reason | 含义 | 能怎么办 |
 |---|---|---|
 | `ok` | `_h.dat`（原件）在、不是空壳；`verify=True` 时还要求解密后结构完整 | `tier='original'` 直接拿 |
-| `mid_only` | 有**完整图** `.dat`，只是没有原件那一档（`has_full=True`） | 要一张完整图直接 `tier='full'`/`'best'`，一步界面都不碰；别人发的图想要原件可以 `download_image_original()` 去追；**自己发的图本机一般没有更大的一档**（见下表），追也追不到 |
-| `only_thumbnail` | 只有预览图（群聊图从没点开过，`has_full=False`） | `tier='full'` 会驱动界面让微信把完整图下下来；`download_image_original()` 也行 |
+| `mid_only` | 有**完整图** `.dat`，只是没有原件那一档（`has_full=True`） | 要一张完整图直接 `tier='full'`/`'best'`（这两个都只读本机，一步界面都不碰）；确实想要原件再 `download_image_original(want='original')` 去追；**自己发的图本机一般没有更大的一档**（见下表），追也追不到 |
+| `only_thumbnail` | 只有预览图（群聊图从没点开过，`has_full=False`） | `download_image_original()`（默认就要非预览图，它会点开预览让微信把完整图下下来） |
 | `original_partial` | 有 `_h.dat` 但是空壳（<1KB），或 `verify=True` 时解密后**缺 JPEG/PNG 收尾标记**（下到一半） | 再触发一次 |
 | `no_local_copy` / `no_md5` / `no_message_row` | 目录里一份都没有 / 取不到图片指纹 / 这条不是图片 | 核对 `local_id` 与账号目录 |
 
@@ -543,7 +546,7 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
   判成没下完，代码去点「图片原始大小」——而那颗按钮在查看器里只是切显示缩放，
   原图本来就在盘上时点了自然没有任何反应。
 
-正在下载中的截断由 `_wait_h_dat` 的「大小不再变化」轮询负责，不靠尺寸猜。
+正在下载中的截断由 `_wait_tier` 的「大小不再变化」轮询负责，不靠尺寸猜。
 
 本机 211 个会话 4825 条图片消息的实测分布（每会话取最近 400 条）：`mid_only` 2410、
 `only_thumbnail` 1773、`ok` 636、`original_partial` 3（三条都是 <1KB 的空壳）、
@@ -552,7 +555,7 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
 
 **按发送方拆开看，差距非常大**（同一次扫描，按 `real_sender_id` 是不是本机账号分类）：
 
-| 发送方 | 条数 | 有 `_h.dat` | 只有压缩版 `.dat` | 只有缩略图 |
+| 发送方 | 条数 | 有原件 `_h.dat` | 有完整图 `.dat` | 只有预览图 |
 |---|---|---|---|---|
 | 我自己发的 | 554 | **19（3.4%）** | 527（95.1%） | 8 |
 | 别人发的 | 3401 | 611（18.0%） | 1594 | 1192 |
@@ -560,20 +563,29 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
 而且**那 19 条自发图片的 `_h.dat` 全都没有同名的 `.dat`**（别人发的 617 个 `_h.dat` 里
 373 个是两档都有的）。合起来读就是一句话：**自己发出去的图，只有当时勾了「原图」才在
 本机留下原件；没勾的话本机最好的一份就是那个 `.dat`，微信没有更大的原件可下**。
-所以「我发的图片提示找不到原图」是事实陈述，不是 bug——现在这种情况会**直接返回 `None`
-并提示改用 `tier='best'`，不再为它去点一轮界面**（连 `.dat` 都没有的那种例外：打开预览
-会让微信把压缩版下载下来，所以还是要走界面）。
+所以「我发的图片提示找不到原图」这句话里，图其实一直在盘上（527/554 有完整图）。现在
+`download_image_original()` 默认交的就是**非预览图**：本机有原件给原件、有完整图给完整图，
+一步界面都不碰；只有 `want='original'`（只认勾过原图那一档）时才会出现「本机只有完整图
+→ 直接返回 `None` 并指引 `tier='full'`，不去白点一轮界面」这条分支。只有预览图的那种
+例外：打开预览才会让微信把完整图下下来，所以仍然走界面。
 尺寸上也印证：自发图 `.dat` 中位 60KB／最大 770KB，别人发的 `.dat` 中位 58KB，
 而 `_h.dat` 中位 66KB、p75 351KB、最大 15MB——**中位数这么小，任何按绝对大小的
 判据都会误杀**。
+
+**两类现象是同一个原因**：文件是在我们**超时之后**才落盘的。
+- 「报错说取不到，但下一轮同一句代码又说已在本地」
+- 「界面上看起来一直在乱点」
+现在这条路上每个决策点都会先回头看一眼本机（进门、点下一张之前、等档超时之后、
+判失败之前）：盘上有了就交出去并停止后续界面动作，查不到才明确报 `None`。
 
 ### 6.3 群聊图片 / Group chat images
 
 - 群聊图片原图**只有点开查看过才落盘**；否则只有缩略图 / originals only stored after being opened
 - `download_image` 会自动回退缩略图，文件名带 `_thumb` 标记 / auto-falls back to thumbnail (`_thumb`)；
   不想回退就传 `tier='original'`，本机没有原图时返回 `None`（见 §6.2.2）
-- `download_image_original` 通过UI自动化点击图片消息触发微信下载原图 / `download_image_original` triggers download via UI click
-  - 本机已经有合格 `_h.dat` 时**直接解密落盘，不动界面** / a valid `_h.dat` already on disk is decrypted without touching the UI
+- `download_image_original` 默认要的是**非预览图**：本机有原件或完整图就直接解密落盘，两个都没有才驱动界面 / by default it returns the non-thumbnail copy, only driving the UI when neither is on disk
+  - `want='original'` 才是「只认 `_h.dat`」：追不到原件就返回 `None`，**不会拿完整图凑数**
+  - 本机已经有目标那一档时**直接解密落盘，不动界面** / an existing copy is decrypted without touching the UI
   - 会切到对应会话；目标那条图**不在可视区时会按数据库算出的行差滚过去**（`scroll=True`，默认开；`scroll=False` 就只在当前屏上找，绝不动界面）
   - **「哪一行才是这条图」用数据库定位**：可视区里文本行的 `Name` 就是真实正文（会被截断，所以按前 10 字互相包含来比），图片行的 `Name` 恒为「图片」，整段序列与数据库的「文本/图片」序列滑窗对齐，对得上就直接点名目标行。三道门槛缺一不可：
     - 至少**两条文本锚点**且吻合度 ≥0.6——实机撞过可视区只剩一行时「吻合度 1.00」的假高分，那种情况任何偏移都算完美吻合，等于没有信息；
@@ -591,13 +603,15 @@ md.image_status("wxid_xxx", local_id)      # 单条，字段同上
   - **真正下载原件的是「保存」**（↓ 图标，在缩放那颗 ▣ 的右边）。找不到缩放键**不再提前返回**，一律继续走「保存」
   - `download_image_original(..., want='mid')` 是给「只要非预览图」用的：等的是 `.dat` 那一档、**不点缩放键**（点它才会去追原件）、点完界面解密出来的也是 `.dat`。`tier='full'` 本机没货时走的就是这条
   - **批量下载同一会话的多张图不再反复搜索进入**：进函数先读当前会话标题（`current_chat()`，取自输入框的 Name——它一直是会话标题而不是正文），已经是目标会话就跳过搜索；读不到标题时保守照常进入
+  - **每个决策点都先回头看一眼本机**（`_harvest`）：进门、点下一张气泡之前、等档超时之后、界面这条路不通要报失败之前。微信经常在我们要的那一档**之后**才把文件写完——不补这几眼就会出现用户实测的两个现象：「明明已经拿到了还在一张一张瞎点，最后报下载失败」和「重新运行又说已在本地」。补查到了就直接交文件（不再去点「保存」，也少一次真实界面动作）；查不到才明确报 `None`
   - 滚动有一个硬前提：**拿得到微信进程 id**。拿不到就退化成「只认当前屏、绝不滚」（`max_scrolls=0`）并打一条警告——落点无法校验时滚轮可能打进压在微信上面的别的程序
-  - 点完之后是**轮询等** `_h.dat` 出现并停止变大（到 `timeout` 为止），不再固定睡 3 秒取一次
+  - 点完之后是**轮询等**目标那一档出现并停止变大（到 `timeout` 为止），不再固定睡 3 秒取一次：`want='original'` 只等 `_h.dat`，默认 `want='full'` 等 `(_h.dat, .dat)` 两档、**原件优先但完整图也算拿到**
   - 点击坐标依赖 WeChat 4.x 的 `mmui::ChatBubbleReferItemView` 布局（DPI 感知进程下按物理像素定位），不同窗口宽度/DPI 用相对偏移自动适配 / click coords rely on the `mmui::*` layout (physical pixels under a DPI-aware process); relative offset adapts to window width/DPI
   - 预览窗口内的「图片原始大小」按钮是完整 UIA 控件，用 `Click()` 点击 / the preview-window button is a real UIA control and is clicked via `Click()`
   - **「图片原始大小」点了没反应时改点「保存」兜底**：那颗按钮本质是查看器的缩放档，原图已在盘上（或这张根本没有更大的原件）时它不触发任何下载。所以 `_h.dat` 等不出来之后，会点预览窗的「保存」。**实机确认「保存」不是静默落盘，而是弹 Windows 通用保存对话框**：顶层类名 `#32770`，**标题是「保存」而不是「另存为」**（按标题里有没有「另存」去匹配会认不出，现在按「`#32770` + 里面真有一颗以「保存」开头的按钮」认）；默认目录是 `<账号>\temp\InputTemp`，**路径不固定**，文件名预填 `微信图片_<时间戳>_*.jpg`
   - 对话框里的控件形状（逐层 dump 出来的）：`ComboBox name='文件名:'` 里面那层 `Edit name='文件名:'` 才是可写值的——**命中容器还要再往里找 Edit**，直接对外层 ComboBox `SetValue` 是写不进去的；右上角还有一颗 `SearchEditBox name='搜索框'` 的 Edit，**拿「第一个 Edit」会填到这里**；按钮文案带助记符（`保存(S)` / `取消`），所以按前缀匹配。填目标全路径用 `ValuePattern.SetValue`、点按钮用 `InvokePattern.Invoke`，**全程不发键盘**
-  - **任何失败路径都会点「取消」把模态框关掉**——那是模态窗，不关掉就一直压着预览窗，后面每张图都点不到。遍历对话框时 UIA 节点可能在中途失效（切页/关窗），坏一颗就跳过那一支，不能让异常把整条兜底路线打死
+  - **第一遍「保存」拿到的可能还是预览图那一幅**（用户实机反馈：UI 点下载存下来的仍然是预览图，要重新下载才得到原图）。微信「保存」写出的是**当前显示的那一幅**，原件没进显示时它就是预览版。所以拿到保存产物之后要**按尺寸核一遍**：本机已有 `.dat` 而产物比它小两成以上 → 判为预览图；本机只有 `_t.dat` 而产物不超过它 1.3 倍 → 判为预览图。判为预览图时先点「图片原始大小」逼原件进显示，**再点一次「保存」**，两遍里取大的那份；两遍都还是预览图就照交本机最好的那份，并在日志里说明「只能让对方重发原图」。参照不足（两档都不在）时**不猜、也不多等一轮界面**
+  - **任何失败路径都会点「取消」把模态框关掉**——那是模态窗，不关掉就一直压着预览窗，后面每张图都点不到。**点完「保存」还要确认窗口真的关了**：窗还开着就说明那一下没点中按钮，立刻判失败并点「取消」，不再白等 8 秒然后报一句「目标目录里没出现该文件」（那句指不出真正的原因）。遍历对话框时 UIA 节点可能在中途失效（切页/关窗），坏一颗就跳过那一支，不能让异常把整条兜底路线打死
   - 万一以后版本改成静默保存，仍保留「点之前拍快照、点之后找新文件」的收法（快照只走「最近改过」的目录，不整树扫）。两条路都不通才返回 `None`
   - **「保存」拿到的那份不在加密附件树里，`image_status` 永远看不见它**：`image_status` 只看 `msg/attach/<md5(会话)>/<月份>/` 下的 `_t.dat`/`.dat`/`_h.dat` 三档，「保存」写出去的是明文字节（默认落在 `temp\InputTemp`，用户手点的话落在你随手选的那个文件夹）。所以「我之前明明保存过，怎么还提示取不到原图」不是查错了目录——那一档本来就不存在。要「本机最好的那份」用 `download_image(tier='best')`，它直接从 `.dat` 解密，一步界面都不碰
   - 预览窗里找不到「图片原始大小」按钮（这张本来就是原图／微信没给这个入口）会**明确警告并返回 `None`**，指引改用 `tier='best'`，不再和「下载没完成」混成同一种失败
@@ -837,9 +851,9 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 | 方法 / Method | 说明 / Description |
 |---|---|
 | `detect_image_key(monitor)` | 提取图片密钥 / extract image key |
-| `download_image(user, lid, tier)` | 图片（三档：`_h.dat` 原图 / `.dat` 压缩 / `_t.dat` 缩略图；wxgf 转码）/ image, 3 tiers |
-| `download_image_original(user, lid, timeout, min_bytes)` | 触发微信下载原图并等它落盘（本机已有合格 `_h.dat` 时不动界面）/ trigger & wait for the original |
-| `image_status(user, lid)` | 单条图片本机有哪一档 + 原因 / which tier exists |
+| `download_image(user, lid, tier)` | 图片，**只读本机不碰界面**（三档：`_h.dat` 原件 / `.dat` 完整图 / `_t.dat` 预览图；wxgf 转码）/ image, 3 tiers, local only |
+| `download_image_original(user, lid, timeout, min_bytes, want)` | 保证拿到**非预览图**：本机有就解密，没有才驱动界面去下；`want='original'` 时只认 `_h.dat`，追不到就 `None` |
+| `image_status(user, lid)` | 单条图片本机有哪一档 + `available`（有没有原件）/ `has_full`（有没有完整图）+ 原因 |
 | `list_image_status(user, limit)` | 整个会话的档位一览（§6.2.2）/ per-session tier report |
 | `download_voice(user, lid)` | 语音 .silk / voice |
 | `voice_status(user, lid)` | 单条语音取不到的原因 / why a voice has no audio |
