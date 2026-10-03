@@ -39,6 +39,10 @@ dependencies = [
     "opencv-python>=4.8.0",
 ]
 
+[project.scripts]
+# 装完就能直接敲 `wechatauto 消息 文件传输助手`，不用记 python -m（issue #31）
+wechatauto = "wechatauto.cli:main"
+
 [project.optional-dependencies]
 moments = ["pyautogui>=0.9.53", "opencv-python>=4.8.0"]
 guia = ["winsdk>=1.0.0b10", "pypinyin>=0.48.0"]

@@ -3239,8 +3239,75 @@ def t_cli() -> None:
 
     print("[cli] 参数与导入安全")
     p = cli.build_parser()
-    check("没有子命令时给帮助（退出码 2）",
-          cap(lambda: cli.main([]))[0] == 2)
+
+    class _NoTTY:
+        def isatty(self):
+            return False
+
+    o_stdin = sys.stdin
+    sys.stdin = _NoTTY()
+    try:
+        check("脚本/管道里（stdin 不是终端）不进菜单，只打帮助退 2",
+              cap(lambda: cli.main([]))[0] == 2)
+    finally:
+        sys.stdin = o_stdin
+
+    print("[cli] 中文子命令与菜单（新手层）")
+    check("中文子命令翻译得对（消息/导出/图片/体检）",
+          cli.expand_aliases(["消息", "小明"]) == ["messages", "小明"]
+          and cli.expand_aliases(["导出", "a"]) == ["export", "a"]
+          and cli.expand_aliases(["图片"]) == ["images"]
+          and cli.expand_aliases(["体检"]) == ["doctor"])
+    check("英文照旧能用；不认识的词原样交给 argparse",
+          cli.expand_aliases(["messages", "x"]) == ["messages", "x"]
+          and cli.expand_aliases(["nope"]) == ["nope"])
+    check("第一个参数是选项时不动它（--version 不能被改写）",
+          cli.expand_aliases(["--version"]) == ["--version"])
+
+    seen = []
+
+    def rec(name):
+        def _f(a):
+            seen.append((name, getattr(a, "chat", None), getattr(a, "text", None)))
+            return 0
+        return _f
+
+    names = ("cmd_messages", "cmd_export", "cmd_images", "cmd_send", "cmd_listen",
+             "cmd_sessions", "cmd_moments", "cmd_doctor")
+    o = {n: getattr(cli, n) for n in names}
+    o_ask, o_db = cli._ask, cli._db
+    for n in names:
+        setattr(cli, n, rec(n[4:]))
+    sess = [{"username": "wxid_a", "unread": 3}, {"username": "wxid_b", "unread": 0}]
+    cli._db = lambda: FakeDB(sessions=sess, nick="小明")
+    try:
+        ans = iter(["7", "0"])
+        cli._ask = lambda prompt="": next(ans)
+        rc, txt = cap(cli.menu)
+        check("菜单：选 7 → 跑的是 sessions",
+              [s[0] for s in seen] == ["sessions"], str(seen))
+        seen.clear()
+        ans = iter(["1", "2", "0"])            # 看消息 → 按序号挑第 2 个会话 → 退出
+        rc, txt2 = cap(cli.menu)
+        check("菜单里列出了可选会话（带未读数，不用自己想起 username）",
+              "小明" in txt2 and "未读 3" in txt2 and "1." in txt2, txt2.strip()[:70])
+        check("挑序号 2 → messages 收到的就是那个会话的 username",
+              seen[:1] == [("messages", "wxid_b", None)], str(seen))
+        seen.clear()
+        ans = iter(["4", "1", "你好", "0"])     # 发消息 → 挑会话 → 内容 → 退出
+        rc, txt3 = cap(cli.menu)
+        check("菜单里发消息默认带 --verify（发完自己回读确认）",
+              ("send", None, "你好") in seen, str(seen))
+        seen.clear()
+        ans = iter(["9", "0"])
+        rc, txt4 = cap(cli.menu)
+        check("按错编号只说「没有这个选项」，既不退也不跑东西",
+              "没有这个选项" in txt4 and not seen, txt4.strip()[:40])
+    finally:
+        for n, f in o.items():
+            setattr(cli, n, f)
+        cli._ask, cli._db = o_ask, o_db
+    check("菜单桩件全部还原", all(getattr(cli, n) is o[n] for n in names))
     try:
         cli.main(["--version"])
         ver = False

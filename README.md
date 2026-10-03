@@ -58,23 +58,29 @@ pip install winsdk pypinyin
 No Python required — after `pip install`, just run commands (asked for in issue #31;
 **the existing Python API is unchanged**, these are plain callers of it):
 
+**Easiest one:** type `wechatauto` (or `python -m wechatauto`) with nothing else — it runs a
+health check, then shows a numbered menu (read messages / export / download images / send /
+listen / moments), so you never have to remember a flag.
+
 ```bash
-python -m wechatauto doctor                        # account / DB keys / image key / UIA tree at a glance
-python -m wechatauto sessions                      # session list
-python -m wechatauto messages 文件传输助手 --limit 20       # recent messages (--type image, --json)
-python -m wechatauto export 文件传输助手 --out history.txt  # dump to a UTF-8 text file
-python -m wechatauto images GroupName --out D:\img --limit 50
-python -m wechatauto send "hello" --to 文件传输助手 --verify # drives the real client
-python -m wechatauto listen GroupName              # print new messages until Ctrl+C
-python -m wechatauto moments --me
+wechatauto                        # follow the prompts (menu only when stdin is a terminal)
+wechatauto doctor                 # account / DB keys / image key / UIA tree at a glance
+wechatauto sessions               # session list
+wechatauto messages 文件传输助手   # recent messages (--type image, --json)
+wechatauto export 文件传输助手     # dump to a UTF-8 text file
+wechatauto images GroupName --out D:\img
+wechatauto send "hello" --to 文件传输助手 --verify    # drives the real client
+wechatauto listen GroupName       # print new messages until Ctrl+C
+wechatauto moments --me
 ```
 
-Any handle works for a chat: nickname, remark, wxid, group id or display name — the command
-resolves the display name into the `username` the DB layer needs (typing a wxid into WeChat's
-search box is the classic beginner trap: no hit, ~60 s of retries, then a bare `None`).
-`images` checks the image AES key first and tells you what to do when it is missing instead of
-returning a wall of `None`. Only `--original` drives the real client (**it moves your WeChat
-window**).
+Subcommands work in **Chinese or English** (`消息` = `messages`, `导出` = `export`,
+`图片` = `images`, `发` = `send`, `听` = `listen`, `体检` = `doctor`). Any handle works for a
+chat — nickname, remark, wxid, group id or display name: the command resolves the display
+name into the `username` the DB layer needs (typing a wxid into WeChat's search box is the
+classic beginner trap: no hit, ~60 s of retries, then a bare `None`). `images` checks the
+image AES key first and tells you what to do when it is missing instead of returning a wall
+of `None`. Only `--original` drives the real client (**it moves your WeChat window**).
 
 ### Read messages
 

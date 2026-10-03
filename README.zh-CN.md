@@ -35,23 +35,29 @@
 ## ⚡ 一条命令
 
 不想写 Python 的话，装完直接敲命令（issue #31 提的需求；**原有 Python 接口一字未改**，
-下面这些命令只是同一批接口的调用方）：
+下面这些命令只是同一批接口的调用方）。
+
+**最省事的一条**：直接敲 `wechatauto`（或 `python -m wechatauto`），它先做一次体检，再把
+「看消息 / 导出 / 下载图片 / 发消息 / 监听 / 朋友圈」列成菜单让你按序号选——不用记任何参数。
 
 ```bash
-python -m wechatauto doctor                         # 账号 / 数据库密钥 / 图片密钥 / 控件树，一眼看清哪一步没通
-python -m wechatauto sessions                       # 会话列表
-python -m wechatauto messages 文件传输助手 --limit 20       # 最近消息（--type image 只看图片，--json 出结构化）
-python -m wechatauto export 文件传输助手 --out history.txt  # 导出成 UTF-8 文本
-python -m wechatauto images 某群 --out D:\img --limit 50    # 下载本机已有的图片
-python -m wechatauto send 你好 --to 文件传输助手 --verify    # 发消息（会驱动微信窗口）
-python -m wechatauto listen 某群                     # 监听新消息，Ctrl+C 退出
-python -m wechatauto moments --me                   # 看自己发的朋友圈
+wechatauto                          # 跟着提示走（在终端里运行才会进菜单）
+wechatauto 体检                     # 账号 / 数据库密钥 / 图片密钥 / 控件树，一眼看清哪一步没通
+wechatauto 会话                     # 列出会话
+wechatauto 消息 文件传输助手        # 最近消息（--type image 只看图片，--json 出结构化）
+wechatauto 导出 文件传输助手        # 导出成 UTF-8 文本
+wechatauto 图片 某群 --out D:\img   # 下载本机已有的图片
+wechatauto 发 你好 --to 文件传输助手 --verify    # 发消息（会驱动微信窗口）
+wechatauto 听 某群                  # 监听新消息，Ctrl+C 退出
+wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ```
 
-会话怎么称呼都行：昵称、备注、wxid、群号、`文件传输助手`——命令会先把显示名补成读库要用的
-`username`（把 wxid 直接填进微信搜索框是新手最常见的坑：搜不到，白等几十秒才报一句
-`None`）。`images` 会先确认图片 AES 密钥，缺了会说清怎么办而不是一堆 `None`；
-只有 `--original` 才驱动微信界面去下载原件（**真的会动你的窗口**）。
+子命令**中英文都行**（`消息` = `messages`、`导出` = `export`、`图片` = `images`、
+`发` = `send`、`听` = `listen`、`体检` = `doctor`、`会话` = `sessions`）。会话怎么称呼都行：
+昵称、备注、wxid、群号——命令会先把显示名补成读库要用的 `username`（把 wxid 直接填进微信
+搜索框是新手最常见的坑：搜不到，白等几十秒才报一句 `None`）。`图片` 会先确认图片 AES 密钥，
+缺了会说清怎么办而不是一堆 `None`；只有 `--original` 才驱动微信界面去下载原件
+（**真的会动你的窗口**）。
 
 ---
 

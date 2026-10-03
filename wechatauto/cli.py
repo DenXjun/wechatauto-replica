@@ -390,11 +390,131 @@ def build_parser():
     return p
 
 
+# ------------------------------------------------------------------ 新手层
+# 中文子命令：issue #31 的原话是「太麻烦了真的不会，比如一条命令」，让人先记住
+# messages/export/images 这几个英文词就是第一道墙。这里只做一层查表翻译，参数定义
+# 仍然只有一份（argparse），不会和英文入口漂移。
+ALIASES = {
+    "体检": "doctor", "诊断": "doctor",
+    "会话": "sessions", "列表": "sessions", "ls": "sessions",
+    "消息": "messages", "看消息": "messages", "msg": "messages", "读": "messages",
+    "导出": "export", "存": "export",
+    "图片": "images", "下载图片": "images", "图": "images", "dl": "images",
+    "发": "send", "发送": "send", "发消息": "send",
+    "听": "listen", "监听": "listen",
+    "朋友圈": "moments",
+}
+
+_MENU = (
+    ("1", "看某个会话最近的消息", "messages"),
+    ("2", "把一个会话导出成文本文件", "export"),
+    ("3", "下载某个会话的图片", "images"),
+    ("4", "发一条消息（会驱动微信窗口）", "send"),
+    ("5", "盯着某个会话的新消息（Ctrl+C 停）", "listen"),
+    ("6", "看朋友圈", "moments"),
+    ("7", "列出会话（不知道名字时先看这个）", "sessions"),
+    ("8", "体检：账号 / 密钥 / 控件树", "doctor"),
+    ("0", "退出", None),
+)
+
+
+def expand_aliases(argv):
+    argv = list(argv)
+    for i, a in enumerate(argv):
+        if a.startswith("-"):
+            continue
+        argv[i] = ALIASES.get(a, a)
+        break
+    return argv
+
+
+def _ask(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "0"
+
+
+def _pick_chat(db, keep=""):
+    """让新手挑会话，而不是让他想起 username 长什么样。"""
+    try:
+        rows = db.get_sessions(limit=10)
+    except Exception:
+        rows = []
+    if rows:
+        print("最近这些会话：")
+        for i, s in enumerate(rows, 1):
+            try:
+                name = db.get_nickname(s["username"]) or s["username"]
+            except Exception:
+                name = s["username"]
+            print("  %2d. %s（未读 %s）" % (i, name[:24], s.get("unread")))
+        raw = _ask("要哪个？输入序号或会话名（回车=1，0=返回）"
+                   + ("，上次是 %s" % keep if keep else "") + "：")
+        if raw in ("", "0"):
+            return None, keep
+        if raw.isdigit() and 1 <= int(raw) <= len(rows):
+            return rows[int(raw) - 1]["username"], rows[int(raw) - 1]["username"]
+        return raw, raw
+    raw = _ask("会话名（昵称 / 备注 / wxid / 群号都行，0=返回）：")
+    return (None if raw in ("", "0") else raw), raw or keep
+
+
+def menu():
+    """不带子命令、又是人在终端前时走这里：一条命令 + 跟着提示走。"""
+    _utf8_stdout()
+    p = build_parser()
+    db = _db()
+    print("wechatauto %s —— 记不住命令就跟着提示走。输入 0 退出。" % _version())
+    keep = ""
+    while True:
+        print()
+        for key, label, _cmd in _MENU:
+            print("  %s. %s" % (key, label))
+        pick = _ask("要做什么？")
+        if pick in ("", "0", "q", "quit"):
+            return 0
+        cmd = next((c for k, _l, c in _MENU if k == pick), None)
+        if cmd is None:
+            print("没有这个选项。")
+            continue
+        try:
+            if cmd in ("moments", "sessions", "doctor"):
+                a = p.parse_args([cmd])
+                rc = int(a.func(a) or 0)
+            else:
+                chat, keep = _pick_chat(db, keep)
+                if not chat:
+                    continue
+                argv = [cmd, chat]
+                if cmd == "send":
+                    text = _ask("要发什么内容（0=返回）：")
+                    if text in ("", "0"):
+                        continue
+                    argv = ["send", text, "--to", chat, "--verify"]
+                args = p.parse_args(argv)
+                rc = int(args.func(args) or 0)
+            if rc:
+                print("（这条没成功，上面有原因；输入 8 可以先体检）")
+        except KeyboardInterrupt:
+            print("\n已中断，回到菜单。")
+        except SystemExit as e:          # 子命令里的明确报错不退出整个菜单
+            if isinstance(e.code, str) and "wxid" in e.code:
+                print(e.code)
+            else:
+                raise
+    return 0
+
+
 def main(argv=None):
     _utf8_stdout()
     p = build_parser()
-    args = p.parse_args(argv)
+    args = p.parse_args(expand_aliases(sys.argv[1:] if argv is None else argv))
     if not getattr(args, "cmd", None):
+        # 人站在终端前 → 进菜单；脚本/管道里 → 照旧打印帮助并退 2（不能把 CI 挂住）
+        if sys.stdin is not None and sys.stdin.isatty():
+            return menu()
         p.print_help()
         return 2
     try:

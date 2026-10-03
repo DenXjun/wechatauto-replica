@@ -78,6 +78,17 @@ issue #31：「能不能把代码调用搞简单一点？太麻烦了，比如�
 不想写 Python 的人不必先学会 `WeChatDB` / `MediaDownloader` / `WeChatGUI` / `MomentDB`
 四个对象怎么拼。
 
+**新手只记一条**：`wechatauto`（或 `python -m wechatauto`）**不带任何参数**。它先做一次体检
+（账号 / 数据库密钥 / 图片密钥 / 控件树），再把「看消息 / 导出 / 下载图片 / 发消息 / 监听 /
+朋友圈」列成编号菜单；挑会话时直接列出最近 10 个会话（昵称 + 未读数）让你按序号选，不需要
+知道 `username` 长什么样。菜单只在 stdin 是终端时进入——脚本/管道里 `python -m wechatauto`
+照旧打帮助退 2，不会把 CI 挂在输入上。
+
+`pip install` 之后还带一个控制台脚本 `wechatauto`（`pyproject.toml` 的 `[project.scripts]`），
+所以连 `python -m` 都不用敲。子命令**中英都认**（`消息`=`messages`、`导出`=`export`、
+`图片`=`images`、`发`=`send`、`听`=`listen`、`体检`=`doctor`、`会话`=`sessions`）——只是
+一层查表翻译，参数定义仍然只有 argparse 那一份，不会两处漂移。
+
 ```bash
 python -m wechatauto doctor                          # 账号 / 数据库密钥 / 图片密钥 / 控件树
 python -m wechatauto sessions --limit 20             # 会话列表（--json 出结构化）
