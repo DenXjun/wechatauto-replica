@@ -3011,16 +3011,283 @@ def t_image() -> None:
         shutil.rmtree(p, ignore_errors=True)
 
 
+# ----------------------------------------------------------------------
+# 15. 一条命令的入口（issue #31）——纯离线：假 db / 假 MediaDownloader / 临时目录
+# ----------------------------------------------------------------------
+def t_cli() -> None:
+    """issue #31「能不能把代码调用搞简单一点？太麻烦了，比如一条命令」。
+
+    CLI 的价值全在替用户吸收三个坑：① 读库要 username、驱动界面要显示名；② 下载图片
+    前得先有图片密钥；③ 正文是整段 XML 时别满屏标签。这三件事加参数解析都得离线钉住，
+    否则「简单」只是把踩坑从 Python 挪到命令行。"""
+    import contextlib
+    import io as _io
+    import shutil
+    import tempfile
+    from types import SimpleNamespace as types_ns
+
+    import wechatauto.cli as cli
+
+    def cap(fn, *a, **k):
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = fn(*a, **k)
+        return rc, buf.getvalue()
+
+    print("[cli] 会话名 / wxid / 群号都能传（读库要 username，界面要显示名）")
+
+    class FakeDB:
+        wxid = "wxid_me"
+
+        def __init__(self, hits=(), nick="小明", sessions=(), msgs=()):
+            self.hits, self.nick, self.sessions, self.msgs = \
+                list(hits), nick, list(sessions), list(msgs)
+
+        def get_nickname(self, u):
+            return self.nick
+
+        def search_contact(self, kw):
+            return [h for h in self.hits if kw in (h.get("nick_name"),
+                                                   h.get("remark"),
+                                                   h.get("username"))]
+
+        def get_sessions(self, limit=100):
+            return self.sessions
+
+        def get_messages(self, user, limit=20, offset=0):
+            self.last_user = user
+            return self.msgs[:limit]
+
+    check("filehelper → username 原样、显示名取昵称",
+          cli.resolve_chat(FakeDB(), "filehelper") == ("filehelper", "小明"))
+    check("wxid_ 开头 → 直接当 username（不白搜一次）",
+          cli.resolve_chat(FakeDB(), "wxid_abc123") == ("wxid_abc123", "小明"))
+    check("群号 → 直通；昵称查不到时显示名退回本身",
+          cli.resolve_chat(FakeDB(nick=""), "12345@chatroom")
+          == ("12345@chatroom", "12345@chatroom"))
+    check("给的是昵称且唯一命中 → 补成 username（这就是不补的那类「白等几十秒」）",
+          cli.resolve_chat(FakeDB(hits=[{"username": "wxid_x", "nick_name": "小明",
+                                         "remark": ""}]), "小明")
+          == ("wxid_x", "小明"))
+    buf = _io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cli.resolve_chat(FakeDB(hits=[{"username": "a", "nick_name": "重名",
+                                           "remark": ""},
+                                          {"username": "b", "nick_name": "重名",
+                                           "remark": ""}]), "重名")
+        code, said = 0, buf.getvalue()
+    except SystemExit as e:
+        code, said = int(e.code or 0), buf.getvalue()
+    check("两个联系人同名 → 明确要用户改用 wxid，不随便挑一个",
+          code != 0 and "wxid" in said, said.strip()[:60])
+    check("群名不在通讯录里 → 照原样传下去（读库走 name2id，不靠 contact.db）",
+          cli.resolve_chat(FakeDB(), "26级新生群") == ("26级新生群", "26级新生群"))
+    check("空串不炸", cli.resolve_chat(FakeDB(), "") == ("", ""))
+
+    print("[cli] 正文与时间：XML 别满屏标签")
+    vid = {"type": "视频", "create_time": 1790000000,
+           "content": '<?xml version="1.0"?><msg><videomsg length="4211669" '
+                      'playlength="151"/></msg>'}
+    line = cli._fmt_line(vid)
+    check("视频正文刮成属性提示（playlength/length）", "playlength=151" in line, line)
+    check("不再把原始 XML 标签打到终端", "<msg>" not in line and "<?xml" not in line)
+    check("纯文本原样", cli._body({"content": "你好"}) == "你好")
+    check("超长正文截住（不刷屏）", len(cli._body({"content": "哈" * 900})) <= 400)
+    check("create_time 缺失也不抛", "None" in cli._fmt_line({"content": "x"}))
+
+    print("[cli] --type 过滤：中英文都收")
+    rows = [{"type": "文本", "content": "a", "create_time": 1},
+            {"type": "图片", "content": "[图片]", "create_time": 2}]
+    db = FakeDB(hits=[{"username": "wxid_x", "nick_name": "小明", "remark": ""}],
+                msgs=rows)
+    _u, _d, got = cli._messages(db, "小明", 10, 0, "image")
+    check("--type image 只要图片行（库里类型名是中文）",
+          [r["type"] for r in got] == ["图片"], str(got))
+    _u, _d, got2 = cli._messages(db, "小明", 10, 0, "文本")
+    check("中文名照样能用", [r["type"] for r in got2] == ["文本"])
+    _u, _d, got3 = cli._messages(db, "小明", 10, 0, None)
+    check("不传 --type 全给", len(got3) == 2)
+    check("过滤时读库用的是补出来的 username", db.last_user == "wxid_x", db.last_user)
+
+    print("[cli] images：没有图片密钥就说什么、缺档时回显 reason")
+    import wechatauto.media as media_mod
+    o_md = media_mod.MediaDownloader
+
+    class FakeMD:
+        made = []
+        calls = []
+
+        def __init__(self, db, save_dir=None):
+            self.save_dir = save_dir
+            FakeMD.made.append(self)
+
+        def detect_image_key(self):
+            return None if self.no_key else ("k", 1)
+
+        no_key = False
+
+        def download_image(self, user, lid, save_dir=None, tier=None):
+            FakeMD.calls.append(("local", lid))
+            return "%s/%s_%s.jpg" % (save_dir, user, lid)
+
+        def download_image_original(self, user, lid, save_dir=None, chat_name=None):
+            FakeMD.calls.append(("ui", lid, chat_name))
+            return None
+
+        def image_status(self, user, lid):
+            return {"tiers": {"thumb": 900}, "reason": "only_thumbnail"}
+
+    class ImgDB(FakeDB):
+        def get_image_rows(self, user, limit=300):
+            return [{"local_id": 7}, {"local_id": 8}]
+
+    media_mod.MediaDownloader = FakeMD
+    try:
+        FakeMD.no_key = True
+        o_db, cli._db = cli._db, (lambda: ImgDB())
+        try:
+            rc, txt = cap(cli.cmd_images, types_ns(chat="小明", limit=5,
+                                                   out="/tmp/x", tier=None,
+                                                   original=False))
+        finally:
+            cli._db = o_db
+        check("拿不到图片密钥 → 非零退出并说清怎么办（点开一张图）",
+              rc != 0 and "密钥" in txt and "点开" in txt, txt.strip()[:60])
+        FakeMD.no_key = False
+        FakeMD.calls = []
+        o_db = cli._db
+        cli._db = lambda: ImgDB()
+        try:
+            rc, txt = cap(cli.cmd_images, types_ns(chat="小明", limit=5,
+                                                   out="/tmp/x", tier=None,
+                                                   original=False))
+            after_local = list(FakeMD.calls)
+            rc2, txt2 = cap(cli.cmd_images, types_ns(chat="小明", limit=5,
+                                                     out="/tmp/x", tier=None,
+                                                     original=True))
+            after_ui = list(FakeMD.calls)
+        finally:
+            cli._db = o_db
+        check("有密钥 → 两张都交出来", rc == 0 and "2 张已存" in txt, txt.strip()[-40:])
+        check("默认一次界面都不碰：只走 download_image",
+              [c[0] for c in after_local] == ["local", "local"], str(after_local))
+        check("--original 才驱动界面（每张一次，不多不少）",
+              [c[0] for c in after_ui[2:]] == ["ui", "ui"], str(after_ui[2:]))
+        check("--original 把显示名交给 chat_name（传 wxid 进搜索框就白等几十秒）",
+              len(after_ui[2:]) == 2 and all(c[2] == "小明" for c in after_ui[2:]),
+              str(after_ui[2:]))
+        check("--original 拿不到时按「没拿到」计数，并提示本机档位",
+              "0 张已存" in txt2 and "2 张没拿到" in txt2, txt2.strip()[-46:])
+    finally:
+        media_mod.MediaDownloader = o_md
+
+    print("[cli] export：永远 UTF-8，行数和消息数一致")
+    tmp = tempfile.mkdtemp(prefix="wxcli-")
+    out = os.path.join(tmp, "h.txt")
+    o_db = cli._db
+    cli._db = lambda: FakeDB(msgs=[{"type": "文本", "content": "你好",
+                                    "create_time": 1790000000},
+                                   {"type": "文本", "content": "在吗",
+                                    "create_time": 1790000001}])
+    try:
+        rc, txt = cap(cli.cmd_export, types_ns(chat="filehelper", limit=10,
+                                               type=None, out=out))
+    finally:
+        cli._db = o_db
+    body = open(out, encoding="utf-8").read()
+    check("导出两行、UTF-8 读回中文没坏", rc == 0 and len(body.strip().splitlines()) == 2,
+          repr(body[:40]))
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    print("[cli] listen：回调里打的是昵称，注册的会话是补出来的 username")
+    import wechatauto.db as db_mod
+    o_lst, o_db = db_mod.Listener, cli._db
+    caught = {}
+
+    class FakeListener:
+        def __init__(self, db, interval=1.0):
+            self.db = db
+
+        def add_listener(self, user, cb):
+            caught["user"], caught["cb"] = user, cb
+
+        def add_all(self, cb):
+            caught["all"], caught["cb"] = True, cb
+
+        def start(self):
+            raise KeyboardInterrupt
+
+        def stop(self):
+            caught["stopped"] = True
+
+    db_mod.Listener = FakeListener
+    cli._db = lambda: FakeDB(nick="小明")
+    try:
+        cap(cli.cmd_listen, types_ns(chat="小明", all=False, interval=0.0))
+        _rc, txt = cap(lambda: caught["cb"]({"chat": "wxid_x", "type": "文本",
+                                             "content": "在吗",
+                                             "create_time": 1790000000,
+                                             "sender_username": ""}, None))
+    finally:
+        cli._db, db_mod.Listener = o_db, o_lst
+    check("注册的是补全后的会话名（不是原样传下去的显示名）",
+          caught.get("user") == "小明", str(caught.get("user")))
+    check("打印用昵称，不把 wxid 甩给用户",
+          "wxid_x" not in txt and "小明" in txt and "在吗" in txt, txt.strip()[:50])
+    check("Ctrl+C 之后确实 stop() 了", caught.get("stopped") is True)
+
+    print("[cli] 参数与导入安全")
+    p = cli.build_parser()
+    check("没有子命令时给帮助（退出码 2）",
+          cap(lambda: cli.main([]))[0] == 2)
+    try:
+        cli.main(["--version"])
+        ver = False
+    except SystemExit as e:
+        ver = e.code == 0
+    check("--version 还是老行为（退出 0，不跑任何功能）", ver)
+    try:
+        p.parse_args(["images", "x", "--tier", "bogus"])
+        bad_tier = False
+    except SystemExit:
+        bad_tier = True
+    check("非法 tier 由 argparse 挡住", bad_tier)
+    rc, txt = cap(cli.cmd_send, types_ns(text=None, file=None, image=None,
+                                         to=None, verify=False))
+    check("send 什么都没给 → 直接说清要发什么（不会去动微信窗口）",
+          rc != 0 and "发" in txt, txt.strip()[:40])
+    # 「import 就把微信窗口激活」是 issue #8 的老坑，但模块在不在 sys.modules 里
+    # 说明不了任何事（import 任何子模块都会先跑包 __init__）。这里钉的是 CLI 自己
+    # 能控制的那半：界面栈只能在子命令函数里 import，`--help`/`--version` 这条
+    # 路径不该需要 pyautogui / winsdk 这些可选依赖。
+    src = open(os.path.join(ROOT, "wechatauto", "cli.py"), encoding="utf-8").read()
+    head = src[:src.index("\ndef ")]
+    import re as _re
+    lines = [l.strip() for l in head.splitlines()
+             if l.strip().startswith(("import ", "from "))]
+    heavy = [w for w in ("guia", "uia_driver", "media", "moment", "sender",
+                         "pyautogui", "winsdk")
+             if any(_re.search(r"\b%s\b" % w, l) for l in lines)]
+    check("cli 顶部不 import 界面栈（只有子命令函数里才拉）", not heavy,
+          "%s（顶层 import：%s）" % (heavy, lines))
+    check("子命令里确实是延迟 import（quick_send / MediaDownloader / MomentDB）",
+          all(s in src for s in ("from wechatauto.guia import",
+                                 "from wechatauto.media import MediaDownloader",
+                                 "from wechatauto import MomentDB")))
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
          "gate": t_gate, "click": t_click, "listen": t_listen, "moment": t_moment,
          "sender": t_sender, "voice": t_voice, "tree": t_tree, "image": t_image,
-         "keys": t_keys, "sessions": t_sessions, "messages": t_messages}
+         "keys": t_keys, "sessions": t_sessions, "messages": t_messages,
+         "cli": t_cli}
 
 
 def main() -> int:
     want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click", "listen",
                             "moment", "sender", "voice", "tree", "image",
-                            "keys", "sessions", "messages"]
+                            "keys", "sessions", "messages", "cli"]
     for name in want:
         fn = TESTS.get(name)
         if not fn:

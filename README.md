@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.4.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.4.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -52,6 +52,29 @@ pip install -e .
 # extra deps for the OCR sending path:
 pip install winsdk pypinyin
 ```
+
+### One command (CLI)
+
+No Python required — after `pip install`, just run commands (asked for in issue #31;
+**the existing Python API is unchanged**, these are plain callers of it):
+
+```bash
+python -m wechatauto doctor                        # account / DB keys / image key / UIA tree at a glance
+python -m wechatauto sessions                      # session list
+python -m wechatauto messages 文件传输助手 --limit 20       # recent messages (--type image, --json)
+python -m wechatauto export 文件传输助手 --out history.txt  # dump to a UTF-8 text file
+python -m wechatauto images GroupName --out D:\img --limit 50
+python -m wechatauto send "hello" --to 文件传输助手 --verify # drives the real client
+python -m wechatauto listen GroupName              # print new messages until Ctrl+C
+python -m wechatauto moments --me
+```
+
+Any handle works for a chat: nickname, remark, wxid, group id or display name — the command
+resolves the display name into the `username` the DB layer needs (typing a wxid into WeChat's
+search box is the classic beginner trap: no hit, ~60 s of retries, then a bare `None`).
+`images` checks the image AES key first and tells you what to do when it is missing instead of
+returning a wall of `None`. Only `--original` drives the real client (**it moves your WeChat
+window**).
 
 ### Read messages
 

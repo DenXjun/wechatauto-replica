@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.4.2
+> 当前版本：1.2.4.3
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -42,6 +42,29 @@
 ![解密读取微信 4.x 加密数据库](docs/demo_db_files.gif)
 
 *直接解密读取 `xwechat_files/.../db_storage/` 下的 `contact.db` / `message_*.db` / `sns.db` 加密库——纯本地，无 Web API。*
+
+---
+
+## ⚡ 一条命令
+
+不想写 Python 的话，装完直接敲命令（issue #31 提的需求；**原有 Python 接口一字未改**，
+下面这些命令只是同一批接口的调用方）：
+
+```bash
+python -m wechatauto doctor                         # 账号 / 数据库密钥 / 图片密钥 / 控件树，一眼看清哪一步没通
+python -m wechatauto sessions                       # 会话列表
+python -m wechatauto messages 文件传输助手 --limit 20       # 最近消息（--type image 只看图片，--json 出结构化）
+python -m wechatauto export 文件传输助手 --out history.txt  # 导出成 UTF-8 文本
+python -m wechatauto images 某群 --out D:\img --limit 50    # 下载本机已有的图片
+python -m wechatauto send 你好 --to 文件传输助手 --verify    # 发消息（会驱动微信窗口）
+python -m wechatauto listen 某群                     # 监听新消息，Ctrl+C 退出
+python -m wechatauto moments --me                   # 看自己发的朋友圈
+```
+
+会话怎么称呼都行：昵称、备注、wxid、群号、`文件传输助手`——命令会先把显示名补成读库要用的
+`username`（把 wxid 直接填进微信搜索框是新手最常见的坑：搜不到，白等几十秒才报一句
+`None`）。`images` 会先确认图片 AES 密钥，缺了会说清怎么办而不是一堆 `None`；
+只有 `--original` 才驱动微信界面去下载原件（**真的会动你的窗口**）。
 
 ---
 
@@ -858,7 +881,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.4.2 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.4.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -888,6 +911,29 @@ pip install -e .
 # extra deps for the OCR sending path:
 pip install winsdk pypinyin
 ```
+
+### One command (CLI)
+
+No Python required — after `pip install`, just run commands (asked for in issue #31;
+**the existing Python API is unchanged**, these are plain callers of it):
+
+```bash
+python -m wechatauto doctor                        # account / DB keys / image key / UIA tree at a glance
+python -m wechatauto sessions                      # session list
+python -m wechatauto messages 文件传输助手 --limit 20       # recent messages (--type image, --json)
+python -m wechatauto export 文件传输助手 --out history.txt  # dump to a UTF-8 text file
+python -m wechatauto images GroupName --out D:\img --limit 50
+python -m wechatauto send "hello" --to 文件传输助手 --verify # drives the real client
+python -m wechatauto listen GroupName              # print new messages until Ctrl+C
+python -m wechatauto moments --me
+```
+
+Any handle works for a chat: nickname, remark, wxid, group id or display name — the command
+resolves the display name into the `username` the DB layer needs (typing a wxid into WeChat's
+search box is the classic beginner trap: no hit, ~60 s of retries, then a bare `None`).
+`images` checks the image AES key first and tells you what to do when it is missing instead of
+returning a wall of `None`. Only `--original` drives the real client (**it moves your WeChat
+window**).
 
 ### Read messages
 

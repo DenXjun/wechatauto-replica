@@ -14,6 +14,7 @@
 ## 目录 / Table of Contents
 
 1. [安装与准备 / Installation & Setup](#1-安装与准备--installation--setup)
+1.5 [一条命令 / One-command CLI](#15-一条命令--one-command-cli)
 2. [整体架构 / Architecture Overview](#2-整体架构--architecture-overview)
 3. [数据库读取 / Database Reading (WeChatDB)](#3-数据库读取--database-reading-wechatdb)
 4. [实时消息监听 / Real-time Listening](#4-实时消息监听--real-time-message-listening)
@@ -67,6 +68,44 @@ print(wechatauto.__version__)   # 1.1.5.1 (beta)
 > 之后密钥缓存到本地，秒开。
 > The first `WeChatDB()` call scans the WeChat process memory to extract DB keys
 > (~6s). Keys are cached locally afterwards, so later runs are instant.
+
+---
+
+## 1.5 一条命令 / One-command CLI
+
+issue #31：「能不能把代码调用搞简单一点？太麻烦了，比如一条命令」。`wechatauto/cli.py`
+给了一层命令行入口，**原有 Python 接口一字未改**——CLI 只是下面那些对象的调用方，
+不想写 Python 的人不必先学会 `WeChatDB` / `MediaDownloader` / `WeChatGUI` / `MomentDB`
+四个对象怎么拼。
+
+```bash
+python -m wechatauto doctor                          # 账号 / 数据库密钥 / 图片密钥 / 控件树
+python -m wechatauto sessions --limit 20             # 会话列表（--json 出结构化）
+python -m wechatauto messages 文件传输助手 --limit 20 [--type image] [--json]
+python -m wechatauto export 文件传输助手 --limit 500 [--out history.txt]
+python -m wechatauto images 某群 --limit 50 [--out D:\img] [--tier best] [--original]
+python -m wechatauto send 你好 --to 文件传输助手 [--verify] [--file x.pdf | --image x.png]
+python -m wechatauto listen 某群 [--all] [--interval 1]
+python -m wechatauto moments [--limit 10] [--me] [--json]
+```
+
+它替用户吸收的三件事，正是新手最容易卡住的地方：
+
+| 坑 | 不吸收会怎样 | CLI 怎么做 |
+|---|---|---|
+| 读库要 `username`，驱动界面要显示名（微信搜索框不认 wxid） | 把 wxid 填进搜索框 → 搜不到 → 白等几十秒返回 `None`，日志里也看不出为什么 | `resolve_chat()`：`filehelper` / `wxid_*` / `*@chatroom` 直通；给昵称/备注就查 `contact.db` 补成 username；**同名多人时明确报错要你用 wxid，不随便挑一个**；通讯录里没有（群）就照原样传 |
+| 下载图片要先有图片 AES 密钥 | 每张都返回 `None`，看起来像「库坏了」 | `images` 进门先 `detect_image_key()`，拿不到就直接说「在微信里点开任意一张图后重跑」，并提示 `doctor` 能看状态 |
+| Windows 控制台是 GBK | 中文正文/箭头直接 `UnicodeEncodeError`，或打印成 `?` | `main()` 第一件事把 stdout/stderr 重设为 UTF-8（`errors="replace"`）；`export` 永远写 UTF-8 文件 |
+
+另外两条是显示层的：视频/文件/引用这类正文是整段 XML，CLI 刮成 `[非文本正文] playlength=151
+length=4211669` 这种一行提示（原文要用 `--json` 看）；`--type` 中英文都收（`image` 和 `图片`
+等价），因为库里类型名是中文，只收中文会让人以为「这个会话没有图片」。
+
+**边界要说清**：`send` / `listen` / `images --original` 会驱动真实客户端，走 `rhythm`
+节流档（默认 `natural`），和直接用那些对象没有区别——CLI 不会绕过任何闸门，也不会替你
+点「进入微信」。退出码：0 成功、非 0 失败、2 是没给子命令（打印帮助）。
+`doctor` 是排查入口：它把「数据库密钥几张能用 / 图片密钥有没有 / 控件树物化没有」三件事
+一次说完，这三件里任何一件为 0，后面的命令都会失败，而且失败原因各不相同。
 
 ---
 

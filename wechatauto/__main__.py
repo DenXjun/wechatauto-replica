@@ -1,15 +1,11 @@
-import argparse
-from wechatauto import __version__
+"""``python -m wechatauto`` —— 一条命令的入口。
 
+真正的实现都在 :mod:`wechatauto.cli`；这里只留一层薄分发，顺便保住老行为：
+``python -m wechatauto --version`` / ``-v`` 以前就直接打印版本号，现在仍然如此。
+"""
+import sys
 
-def main():
-    parser = argparse.ArgumentParser(description="wechatauto 命令行工具")
-    parser.add_argument('--version', '-v', action='store_true', help='显示版本信息')
-    args = parser.parse_args()
+from wechatauto.cli import main
 
-    if args.version:
-        print(f"wechatauto {__version__}")
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
