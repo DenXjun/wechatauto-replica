@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.4.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.4.4 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -215,6 +215,17 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.4.4 (2026-10-03)
+
+- **New: one command — `wechatauto` / `python -m wechatauto`** (issue #31: "can you make calling it simpler? it's too much, e.g. one command"). **The existing Python API is unchanged** — the CLI is just a caller of `WeChatDB` / `MediaDownloader` / `guia.quick_send` / `MomentDB`; anyone who prefers Python keeps doing exactly that.
+  - **Remember one thing only**: after installing, type `wechatauto` with no arguments. It runs a health check first (account / DB keys / image key / UIA tree — whichever one is zero is stated with the concrete next step), then shows a numbered menu: read messages / export / download images / send / listen / moments / list sessions / health check. Picking a chat lists your 10 most recent sessions (nickname + unread count) to choose by number, **so you never need to know what a `username` looks like**. The menu only opens when stdin is a terminal; in scripts and pipes `python -m wechatauto` still prints help and exits 2, so it can never hang a CI on `input()`.
+  - Subcommands work in **Chinese or English**: `消息`=`messages`, `导出`=`export`, `图片`=`images`, `发`=`send`, `听`=`listen`, `体检`=`doctor`, `会话`=`sessions`, `朋友圈`=`moments`. That is a one-line lookup table — the argument definitions still live in exactly one place (argparse).
+  - Three traps it absorbs for you, which is what "too complicated" actually was: ① the DB layer needs `username` while the UI needs the display name — `resolve_chat()` accepts nickname / remark / wxid / group id, and when two contacts share a name it asks for a wxid instead of silently picking one (typing a wxid into WeChat's search box is the number-one cause of "no hit, ~60 s of retries, then a bare `None`"); ② the image AES key is checked before downloading images, and a missing key is reported as what to do next rather than a wall of `None` that looks like a broken library; ③ the Windows console is GBK and Chinese bodies raise `UnicodeEncodeError` — the entry point reconfigures stdout/stderr to UTF-8 first, and `export` always writes UTF-8.
+  - Two display fixes: video/file/quote bodies are whole XML documents, now collapsed to one line such as `[非文本正文] playlength=151 length=4211669` (use `--json` for the raw text); `--type` accepts both English and the Chinese type names stored in the DB (Chinese-only would make people conclude "this chat has no images").
+  - `pyproject.toml` gained `[project.scripts]`, so installing gives you a real `wechatauto` command without `python -m`. Sending defaults to `--verify` (the send is read back from the database).
+- **Not verified (stated plainly)**: the menu's real keystroke path — automation can only feed scripted input, so nobody pressed keys yet; and `send` against the live client (it drives the window and needs the real client behind the `rhythm` gate). Everything else has offline regressions: `tools/selftest.py` **490 checks / 0 failures**, including a new `cli` group of 41 (one of them pins "cli must not import the UI stack at module level" — verified in reverse by hoisting `guia` up, which turns it red).
+
 
 ### v1.2.4.3 (2026-10-01)
 

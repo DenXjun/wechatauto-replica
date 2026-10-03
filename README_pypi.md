@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.4.3
+> 当前版本：1.2.4.4
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -89,6 +89,17 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.2.4.4（2026-10-03）
+
+- **新增：一条命令的入口 `wechatauto` / `python -m wechatauto`**（issue #31「能不能把代码调用搞简单一点？太麻烦了真的不会，比如一条命令」）。**原有 Python 接口一字未改**——命令行只是 `WeChatDB` / `MediaDownloader` / `guia.quick_send` / `MomentDB` 的调用方，不想用它的人照旧写 Python。
+  - **只记一条**：装完直接敲 `wechatauto`（不带任何参数）。它先做一次体检（账号 / 数据库密钥 / 图片密钥 / 控件树——哪一项是 0 就直说下一步干什么），再给编号菜单：看消息 / 导出 / 下载图片 / 发消息 / 监听 / 朋友圈 / 列会话 / 体检。挑会话时列出最近 10 个（昵称 + 未读数）按序号选，**不需要知道 `username` 长什么样**。菜单只在终端里进；脚本/管道里 `python -m wechatauto` 照旧打帮助退 2，不会把 CI 挂在 `input()` 上。
+  - 子命令**中英都认**：`消息`=`messages`、`导出`=`export`、`图片`=`images`、`发`=`send`、`听`=`listen`、`体检`=`doctor`、`会话`=`sessions`、`朋友圈`=`moments`。只是一层查表翻译，参数定义仍然只有 argparse 那一份。
+  - 它替新手吸收的三个坑，正是以前「麻烦」的来源：① 读库要 `username`、驱动界面要显示名——`resolve_chat()` 让昵称/备注/wxid/群号随便传，同名多人时明确要你用 wxid 而不随便挑一个（把 wxid 填进微信搜索框是「搜不到 → 白等几十秒 → 返回一个 `None`」的头号原因）；② 下载图片前先确认图片 AES 密钥，缺了会说清怎么办，而不是一排 `None` 看着像库坏了；③ Windows 控制台默认 GBK，中文正文直接 `UnicodeEncodeError`——入口第一件事把 stdout/stderr 重设 UTF-8，`export` 永远写 UTF-8 文件。
+  - 显示层两条：视频/文件/引用这类正文是整段 XML，刮成 `[非文本正文] playlength=151 length=4211669` 一行提示（要看原文用 `--json`）；`--type` 中英文都收（库里类型名是中文，只收中文会让人以为「这个会话没有图片」）。
+  - `pyproject.toml` 加了 `[project.scripts]`，装完就有 `wechatauto` 这个命令，不必敲 `python -m`。发消息默认带 `--verify`（发完自己回读数据库确认）。
+- **未测（如实说明）**：菜单的真实按键路径——自动化里只能用脚本喂输入，真键盘那一路没跑过；`send` 子命令的真机发送（会驱动窗口，需要真人客户端和 `rhythm` 闸）。其余都有离线回归：`tools/selftest.py` 全量 **490 项 0 失败**，其中 `cli` 组 41 项（含「cli 顶部不许 import 界面栈」这条——把 `guia` 提到顶层它就会报红，反向验过）。
+
 
 ### v1.2.4.3（2026-10-01）
 
@@ -887,7 +898,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.4.3 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.4.4 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1078,6 +1089,17 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.4.4 (2026-10-03)
+
+- **New: one command — `wechatauto` / `python -m wechatauto`** (issue #31: "can you make calling it simpler? it's too much, e.g. one command"). **The existing Python API is unchanged** — the CLI is just a caller of `WeChatDB` / `MediaDownloader` / `guia.quick_send` / `MomentDB`; anyone who prefers Python keeps doing exactly that.
+  - **Remember one thing only**: after installing, type `wechatauto` with no arguments. It runs a health check first (account / DB keys / image key / UIA tree — whichever one is zero is stated with the concrete next step), then shows a numbered menu: read messages / export / download images / send / listen / moments / list sessions / health check. Picking a chat lists your 10 most recent sessions (nickname + unread count) to choose by number, **so you never need to know what a `username` looks like**. The menu only opens when stdin is a terminal; in scripts and pipes `python -m wechatauto` still prints help and exits 2, so it can never hang a CI on `input()`.
+  - Subcommands work in **Chinese or English**: `消息`=`messages`, `导出`=`export`, `图片`=`images`, `发`=`send`, `听`=`listen`, `体检`=`doctor`, `会话`=`sessions`, `朋友圈`=`moments`. That is a one-line lookup table — the argument definitions still live in exactly one place (argparse).
+  - Three traps it absorbs for you, which is what "too complicated" actually was: ① the DB layer needs `username` while the UI needs the display name — `resolve_chat()` accepts nickname / remark / wxid / group id, and when two contacts share a name it asks for a wxid instead of silently picking one (typing a wxid into WeChat's search box is the number-one cause of "no hit, ~60 s of retries, then a bare `None`"); ② the image AES key is checked before downloading images, and a missing key is reported as what to do next rather than a wall of `None` that looks like a broken library; ③ the Windows console is GBK and Chinese bodies raise `UnicodeEncodeError` — the entry point reconfigures stdout/stderr to UTF-8 first, and `export` always writes UTF-8.
+  - Two display fixes: video/file/quote bodies are whole XML documents, now collapsed to one line such as `[非文本正文] playlength=151 length=4211669` (use `--json` for the raw text); `--type` accepts both English and the Chinese type names stored in the DB (Chinese-only would make people conclude "this chat has no images").
+  - `pyproject.toml` gained `[project.scripts]`, so installing gives you a real `wechatauto` command without `python -m`. Sending defaults to `--verify` (the send is read back from the database).
+- **Not verified (stated plainly)**: the menu's real keystroke path — automation can only feed scripted input, so nobody pressed keys yet; and `send` against the live client (it drives the window and needs the real client behind the `rhythm` gate). Everything else has offline regressions: `tools/selftest.py` **490 checks / 0 failures**, including a new `cli` group of 41 (one of them pins "cli must not import the UI stack at module level" — verified in reverse by hoisting `guia` up, which turns it red).
+
 
 ### v1.2.4.3 (2026-10-01)
 
